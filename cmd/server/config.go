@@ -155,8 +155,13 @@ type Config struct {
 		// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` 与归属头
 		// X-IDE-Version）。空 = 内置默认（对齐官方 5.5.4 分发包）。
 		ClientVersion string `json:"client_version"`
-		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（官方内置 CLI 2.137.1）。
+		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（官方内置 CLI 2.161.0）。
 		CliVersion string `json:"cli_version"`
+		// ClientVersionGlobal 国际版（global realm）专用客户端版本段。
+		// CN 与 intl 两条独立发版线（2026-10：CN 5.8.3 / intl 5.8.4）。空 = 内置默认 5.8.4。
+		ClientVersionGlobal string `json:"client_version_global"`
+		// CliVersionGlobal 国际版专用 `CLI/<ver>` 段。空 = 内置默认 2.161.0。
+		CliVersionGlobal string `json:"cli_version_global"`
 		// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
 		// 空 = 旧行为 X-Product="SaaS" 不设 X-IDE-*；配 "WorkBuddy" 则四头跟随。
 		ClientName string `json:"client_name"`
@@ -454,6 +459,12 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_CLI_VERSION"); v != "" {
 		c.Upstream.CliVersion = v
+	}
+	if v := os.Getenv("WB2A_CLIENT_VERSION_GLOBAL"); v != "" {
+		c.Upstream.ClientVersionGlobal = v
+	}
+	if v := os.Getenv("WB2A_CLI_VERSION_GLOBAL"); v != "" {
+		c.Upstream.CliVersionGlobal = v
 	}
 	if v := os.Getenv("WB2A_CLIENT_NAME"); v != "" {
 		c.Upstream.ClientName = v

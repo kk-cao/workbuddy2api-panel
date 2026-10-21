@@ -165,8 +165,17 @@ const accountRestrictedMsg = "request illegal"
 //   - 只看文案："request illegal" 也出现在 11128 通道校验失败里（健康账号）；
 //   - 只看 code：11140 也承载模型级限流文案（应归 ErrSoftRate）。
 func IsAccountRestricted(body string) bool {
-	if !strings.Contains(strings.ToLower(body), accountRestrictedMsg) {
+	lower := strings.ToLower(body)
+	if !strings.Contains(lower, accountRestrictedMsg) {
 		return false
+	}
+	// 11140 也承载**模型级限流**文案（displayMsg "The model provider is rate-limiting
+	// requests."）：那时账号健康，属软限流。code + "request illegal" 双条件仍会命中，
+	// 故必须显式排除限流语义（对齐上游 509e7a6）。误禁用代价远高于一次短冷却。
+	for _, m := range softRateMarkers {
+		if strings.Contains(lower, m) {
+			return false
+		}
 	}
 	return hasBusinessCode(body, "11140")
 }
@@ -362,36 +371,66 @@ func modelBlockFields(body string) (code, msg string) {
 	return code, msg
 }
 
-// hasBusinessCode reports whether a JSON error envelope contains an exact
-// business code in a field named "code". Upstream envelopes vary between
-// top-level and nested error/data objects, so walk the decoded structure.
-func hasBusinessCode(body, want string) bool {
-	var root any
-	if err := json.Unmarshal([]byte(body), &root); err != nil {
-		return false
-	}
-	var walk func(any) bool
-	walk = func(value any) bool {
-		switch node := value.(type) {
-		case map[string]any:
-			if code, ok := node["code"]; ok && strings.TrimSpace(fmt.Sprint(code)) == want {
-				return true
-			}
-			for _, child := range node {
-				if walk(child) {
-					return true
-				}
-			}
-		case []any:
-			for _, child := range node {
-				if walk(child) {
-					return true
-				}
-			}
+// normalizeBusinessCode 只保留数字：上游这条错误路径实际发的是
+// `{"code":11-128,...}`（数字里带连字符，不是合法 JSON），日志/终端渲染又常把它
+// 显示成 `11-128` 或 `"11-128"`。三者必须归一到同一个键，否则按字面比较永远不命中。
+func normalizeBusinessCode(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
 		}
+	}
+	return b.String()
+}
+
+// reBusinessCode 从原文抓 code 字段（允许带引号，允许数字里含连字符）。
+// 只锚定 `"code":` 前缀，requestId 等十六进制串不会误命中。
+var reBusinessCode = regexp.MustCompile(`(?i)"code"\s*:\s*"?([0-9][0-9-]*)"?`)
+
+// hasBusinessCode reports whether an upstream error envelope contains an exact
+// business code in a field named "code". Envelopes vary between top-level and
+// nested error/data objects, so walk the decoded structure; bodies that are not
+// valid JSON (the 11-128 path emits `"code":11-128`) fall back to a text scan.
+func hasBusinessCode(body, want string) bool {
+	want = normalizeBusinessCode(want)
+	if want == "" {
 		return false
 	}
-	return walk(root)
+	var root any
+	if err := json.Unmarshal([]byte(body), &root); err == nil {
+		var walk func(any) bool
+		walk = func(value any) bool {
+			switch node := value.(type) {
+			case map[string]any:
+				if code, ok := node["code"]; ok && normalizeBusinessCode(fmt.Sprint(code)) == want {
+					return true
+				}
+				for _, child := range node {
+					if walk(child) {
+						return true
+					}
+				}
+			case []any:
+				for _, child := range node {
+					if walk(child) {
+						return true
+					}
+				}
+			}
+			return false
+		}
+		if walk(root) {
+			return true
+		}
+	}
+	// 兜底：真实报文（及被截断的日志行）不是合法 JSON，解析必然失败；按原文抓。
+	for _, m := range reBusinessCode.FindAllStringSubmatch(body, -1) {
+		if normalizeBusinessCode(m[1]) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // hasBusinessEnvelope 报告错误 body 是否携带上游业务信封形态（JSON 且含
@@ -745,8 +784,15 @@ type Client struct {
 	// 空 = 内置默认（对齐官方 5.5.4 分发包）。
 	ClientVersion string
 
-	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认（官方内置 CLI 2.137.1）。
+	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认（官方内置 CLI 2.161.0）。
 	CliVersion string
+
+	// ClientVersionGlobal / CliVersionGlobal 国际版（global realm）专用版本段。
+	// CN 与 intl 两条独立发版线（2026-10：CN 5.8.3 / intl 5.8.4），留空时 global
+	// 账号回落 defaultClientVersionGlobal / defaultCliVersionGlobal。
+	// 通用 ClientVersion 非空时仍优先于 realm 默认（显式覆盖语义不变）。
+	ClientVersionGlobal string
+	CliVersionGlobal    string
 
 	// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
 	// 空 = 旧行为：X-Product="SaaS"，不设 X-IDE-*（向后兼容，不突变归因）。

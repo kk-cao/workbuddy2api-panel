@@ -284,12 +284,14 @@ func TestRefreshSessionDead(t *testing.T) {
 }
 
 func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
-	var gotAuth, gotUID, gotProduct string
+	var gotAuth, gotUID, gotProduct, gotIDE, gotPrivate string
 	var gotBody []byte
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		gotAuth = r.Header.Get("Authorization")
 		gotUID = r.Header.Get("X-User-Id")
 		gotProduct = r.Header.Get("X-Product")
+		gotIDE = r.Header.Get("X-IDE-Name")
+		gotPrivate = r.Header.Get("X-Private-Data")
 		gotBody, _ = io.ReadAll(r.Body)
 		return &http.Response{
 			StatusCode: 200,
@@ -306,8 +308,10 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		t.Errorf("200 response should carry nil body, got %q", respBody)
 	}
 	rc.Close()
-	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "WorkBuddy" {
-		t.Errorf("headers: auth=%q uid=%q product=%q", gotAuth, gotUID, gotProduct)
+	// 真实桌面端 chat 头组：X-Product 恒为 SaaS（deploymentType || SaaS），
+	// IDE 名单独走 X-IDE-Name=WorkBuddy，并带 X-Private-Data: true。
+	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "SaaS" || gotIDE != "WorkBuddy" || gotPrivate != "true" {
+		t.Errorf("headers: auth=%q uid=%q product=%q ide=%q private=%q", gotAuth, gotUID, gotProduct, gotIDE, gotPrivate)
 	}
 	if !bytes.Contains(gotBody, []byte(`"stream":true`)) {
 		t.Errorf("stream not forced: %s", gotBody)

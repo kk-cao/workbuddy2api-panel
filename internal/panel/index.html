@@ -955,6 +955,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
 
         <div class="box">
+          <header><h3>模型</h3><span class="grow"></span><span class="note">立即生效</span></header>
+          <div class="pad">
+            <label class="fld"><span class="lb">模型黑名单（models.hidden）</span>
+              <textarea name="models_hidden" rows="2" placeholder="cn:glm-4.7, global:qwen3-max"></textarea>
+              <span class="hint">逗号 / 空格 / 换行分隔。<code>cn:xxx</code> 只隐国内版，<code>global:xxx</code> 只隐国际版，裸名两域都隐。
+                命中后 <code>/v1/models</code> 不再返回该模型，点名调用直接 400 <code>model is hidden by gateway configuration</code>（不打上游、不占号）。留空 = 不隐藏。</span></label>
+          </div>
+        </div>
+
+        <div class="box">
           <header><h3>定时任务</h3></header>
           <div class="pad">
             <div class="grid2">
@@ -1112,9 +1122,29 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </div>
             <div class="hr"></div>
             <div class="grid2">
-              <label class="fld"><span class="lb">出站 User-Agent</span>
-                <input name="user_agent" placeholder="留空 = CLI/2.63.2 CodeBuddy/2.63.2">
-                <span class="hint">影响官网积分记录「使用端」显示；需重启</span></label>
+              <label class="fld"><span class="lb">出站 User-Agent（强制覆盖）</span>
+                <input name="user_agent" placeholder="留空 = 按 realm 自动生成（推荐）">
+                <span class="hint">留空时按下表四项自动拼装，<b>不要填</b>；填了则所有 realm、所有路径都用该值（分档失效）。需重启</span></label>
+            </div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">客户端版本（CN）</span>
+                <input name="client_version" placeholder="留空 = 5.8.3">
+                <span class="hint">UA 的 WorkBuddy 段 + <code>X-IDE-Version</code>；对应 CN 桌面端 5.8.3 安装包</span></label>
+              <label class="fld"><span class="lb">客户端 CLI 版本（CN）</span>
+                <input name="cli_version" placeholder="留空 = 2.161.0">
+                <span class="hint">UA 的 <code>CLI/</code> 段；5.8.3 桌面端<b>内置</b>的 CLI（非你本机 PATH 里那个 2.171.0）</span></label>
+              <label class="fld"><span class="lb">客户端版本（国际版）</span>
+                <input name="client_version_global" placeholder="留空 = 5.8.4">
+                <span class="hint">global 号专用；对应国际版 5.8.4 安装包，CN 号不受影响</span></label>
+              <label class="fld"><span class="lb">客户端 CLI 版本（国际版）</span>
+                <input name="cli_version_global" placeholder="留空 = 2.161.0">
+                <span class="hint">global 号专用；国际版 5.8.4 内置 CLI 同样是 2.161.0</span></label>
+            </div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">当前生效形态</span>
+                <span class="hint">CN 号 → <code>WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0</code><br>
+                global 号 → <code>WorkBuddy/5.8.4 WorkBuddy/5.8.4 CLI/2.161.0</code><br>
+                以上四项留空时即为该值；平台段两个 realm 都是 <code>WorkBuddy</code>（安装包实测）。</span></label>
             </div>
             <div class="hr"></div>
             <div class="grid2">
