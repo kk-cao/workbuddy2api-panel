@@ -314,21 +314,33 @@ const (
 	accountRestrictedCode = "11140"
 	// accountRestrictedMsg 是 11140 账号限制的正文关键词。
 	accountRestrictedMsg = "request illegal"
-	// channelRefusedCode 是通道校验失败的业务码。
+	// channelRefusedCode 是通道校验失败的业务码：上游真实下发的是 5 位数字 11-128。
 	//
-	// 上游实际发送的是 JSON 数字形式 `"code":11-128`；历史讨论里也出现过
-	// `"code":"11-128"` 字符串形式，两种书写都必须命中（normalizeBusinessCode
-	// 用 fmt.Sprint 归一，数字与字符串同形）。
+	// 注意：日志、issue #231 与参考 commit 里写的 "11-128"（带连字符）是**终端渲染
+	// 插入的假象**，原始报文是 `{"code":11-128,...}`（见 testdata/issue231_channel_body.txt
+	// 的 od 输出）。比较统一走 normalizeBusinessCode 的纯数字归一，故 "11-128" /
+	// "11-128" / "11–128" 及字符串形态都命中，抄写歧义不再影响分类。
 	channelRefusedCode = "11-128"
 )
 
-// normalizeBusinessCode 归一业务码书写差异：去空白、把 en/em dash 与 Unicode
-// 负号折成 ASCII '-'。上游信封里出现过 11–128（en dash）这类排版变体，按字节
-// 比较会漏判，把通道校验失败重新推回「未知 4xx」甚至封禁路径。
+// normalizeBusinessCode 归一业务码书写差异：**只保留数字**。
+//
+// 为什么必须丢分隔符：上游通道校验失败的业务码是 5 位数字 `11128`，而日志/终端
+// 渲染会把它显示成 "11-128"（这是显示层插入的连字符，不是上游发的字符）。仓库里
+// 历史注释、issue 与参考 commit 全都抄了显示态 "11-128"，代码里按带连字符的字符串
+// 比较，于是**永远匹配不到真实报文**——分类退化成 ErrClient，既不封号也认不出通道
+// 校验（issue #231 的真实报文就踩了这个坑）。
+//
+// 丢分隔符后 "11128" / "11-128" / "11–128"（en dash）都归一到 "11128"，与上游实际
+// 下发形态无关，彻底消除这类抄写歧义。
 func normalizeBusinessCode(s string) string {
-	s = strings.TrimSpace(s)
-	s = strings.NewReplacer("\u2013", "-", "\u2014", "-", "\u2212", "-").Replace(s)
-	return s
+	var b strings.Builder
+	for _, r := range strings.TrimSpace(s) {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // reBusinessCode 从原始 body 文本里抓业务码。

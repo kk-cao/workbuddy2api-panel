@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 )
@@ -146,5 +147,27 @@ func TestAccountRestrictionReasonKeepsEvidence(t *testing.T) {
 	}
 	if got := AccountRestrictionReason(`{"code":11140,"msg":"request illegal"}`); strings.Contains(got, "requestId=") {
 		t.Fatalf("reason must not invent requestId: %q", got)
+	}
+}
+
+// TestClassifyRealChannelBodyFromJournal 用服务器 journald 抓到的**原始字节**做回归：
+// 上游下发的 code 是 5 位数字 11-128（无连字符），日志/issue 里的 "11-128" 是终端
+// 渲染插入的连字符。参考实现按带连字符的字符串比较，在这个报文上永远不命中。
+func TestClassifyRealChannelBodyFromJournal(t *testing.T) {
+	raw, err := os.ReadFile("testdata/issue231_channel_body.txt")
+	if err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	body := strings.TrimSpace(string(raw))
+	for _, status := range []int{http.StatusBadRequest, http.StatusForbidden} {
+		if got := Classify(status, body); got != ErrChannelRefused {
+			t.Fatalf("status=%d Classify=%s want channel_refused (body=%q)", status, got, body)
+		}
+	}
+	if !IsChannelRefused(body) {
+		t.Fatal("IsChannelRefused must accept the real 11-128 body")
+	}
+	if IsAccountRestricted(body) {
+		t.Fatal("real 11-128 body must never be an account restriction")
 	}
 }
