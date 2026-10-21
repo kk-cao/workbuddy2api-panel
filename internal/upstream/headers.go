@@ -93,6 +93,27 @@ func (c *Client) cliVersionFor(a *auth.Auth) string {
 	return defaultCliVersion
 }
 
+// modelsProbeUA 返回 /v3/config 目录探测使用的 UA。
+// 优先级：config upstream.models_probe_ua_cn / _global（按 realm）> 内置默认。
+// 内置默认刻意与 chat 身份不同（CN 用 IDE、global 用 desktop）：该端点按 UA 的
+// 产品前缀下发不同目录，CN 若换成 chat 的 desktop 身份，目录会混入约 8 个
+// CN 基址不存在的模型（调用直接 400）。版本号不影响内容，只影响画像。
+func (c *Client) modelsProbeUA(a *auth.Auth) string {
+	global := a != nil && a.IsGlobal()
+	if c != nil {
+		if global && c.ModelsProbeUAGlobal != "" {
+			return c.ModelsProbeUAGlobal
+		}
+		if !global && c.ModelsProbeUACN != "" {
+			return c.ModelsProbeUACN
+		}
+	}
+	if global {
+		return c.defaultWorkBuddyUAFor(a)
+	}
+	return codeBuddyIDEUA
+}
+
 // defaultWorkBuddyUAFor 组装默认客户端出站 UA（官方桌面端 RestOperations 层形状）：
 // `WorkBuddy/<clientVersion> WorkBuddy/<clientVersion> CLI/<cliVersion>`。
 //

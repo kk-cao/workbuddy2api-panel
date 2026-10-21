@@ -208,7 +208,7 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 	// 此前并发 IDE/CLI 两路取并集（多拿 auto-chat / deep-model / o4-mini /
 	// enhance-1.0 等 4 个 chat 模型），代价是同一账号秒级出现三种客户端身份。
 	// 若日后需要这些模型，恢复对应 probeV3(...) 行并在下方 mergeV3Routes 里加回。
-	v3DesktopCh := probeV3(c.defaultWorkBuddyUAFor(a))
+	v3DesktopCh := probeV3(c.modelsProbeUA(a))
 	enterpriseCh := make(chan probeResult, 1)
 	go func() {
 		// 企业端点家族：/v2 首选 → /console 兜底（既有探活序，零回归）。

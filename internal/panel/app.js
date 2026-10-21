@@ -1154,6 +1154,7 @@ const CFG_MAP = {
   idle_timeout_seconds: ['upstream', 'idle_timeout_seconds'], user_agent: ['upstream', 'user_agent'],
   client_version: ['upstream', 'client_version'], client_version_global: ['upstream', 'client_version_global'],
   cli_version: ['upstream', 'cli_version'], cli_version_global: ['upstream', 'cli_version_global'],
+  models_probe_ua_cn: ['upstream', 'models_probe_ua_cn'], models_probe_ua_global: ['upstream', 'models_probe_ua_global'],
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
@@ -1171,7 +1172,8 @@ const CFG_MAP = {
  * 该字段（以及提示文案"留空 = 不鉴权"与现状不符的问题）单独处理。
  */
 const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file',
-  'client_version', 'client_version_global', 'cli_version', 'cli_version_global']);
+  'client_version', 'client_version_global', 'cli_version', 'cli_version_global',
+  'models_probe_ua_cn', 'models_probe_ua_global']);
 
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {

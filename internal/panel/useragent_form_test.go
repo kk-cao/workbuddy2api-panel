@@ -18,7 +18,7 @@ func TestUserAgentVersionFormWiring(t *testing.T) {
 		t.Fatalf("read index.html: %v", err)
 	}
 	for _, name := range []string{"user_agent", "client_version", "client_version_global",
-		"cli_version", "cli_version_global"} {
+		"cli_version", "cli_version_global", "models_probe_ua_cn", "models_probe_ua_global"} {
 		if !strings.Contains(string(html), `name="`+name+`"`) {
 			t.Errorf("index.html 缺少 name=%q 表单字段", name)
 		}
@@ -34,6 +34,8 @@ func TestUserAgentVersionFormWiring(t *testing.T) {
 		"client_version_global: ['upstream', 'client_version_global']",
 		"cli_version: ['upstream', 'cli_version']",
 		"cli_version_global: ['upstream', 'cli_version_global']",
+		"models_probe_ua_cn: ['upstream', 'models_probe_ua_cn']",
+		"models_probe_ua_global: ['upstream', 'models_probe_ua_global']",
 	} {
 		if !strings.Contains(src, m) {
 			t.Errorf("app.js CFG_MAP 缺少映射 %q", m)
@@ -42,7 +44,8 @@ func TestUserAgentVersionFormWiring(t *testing.T) {
 	if !strings.Contains(src, "CLEARABLE_CFG = new Set([") {
 		t.Fatal("CLEARABLE_CFG 定义缺失")
 	}
-	for _, k := range []string{"'client_version'", "'client_version_global'", "'cli_version'", "'cli_version_global'"} {
+	for _, k := range []string{"'client_version'", "'client_version_global'", "'cli_version'",
+		"'cli_version_global'", "'models_probe_ua_cn'", "'models_probe_ua_global'"} {
 		if !strings.Contains(src, k) {
 			t.Errorf("CLEARABLE_CFG 未包含 %s（留空无法回落默认）", k)
 		}
@@ -60,7 +63,7 @@ const end = src.indexOf('/* Go 时长字段即时校验');
 if (start < 0 || end < 0 || end < start) throw new Error('cfg region not found');
 const vals = JSON.parse(process.argv[3]);
 const elements = {};
-for (const k of ['user_agent', 'client_version', 'client_version_global', 'cli_version', 'cli_version_global']) {
+for (const k of ['user_agent', 'client_version', 'client_version_global', 'cli_version', 'cli_version_global', 'models_probe_ua_cn', 'models_probe_ua_global']) {
   elements[k] = { value: vals[k] === undefined ? '' : vals[k], type: 'text' };
 }
 const ctx = { console, $: () => ({ elements }) };
@@ -88,16 +91,17 @@ console.log(JSON.stringify(vm.runInContext('collectConfig()', ctx)));
 	// 全空：三个键都必须出现在下发载荷里，值为空串（= 回落默认）。
 	empty := run(`{}`)
 	for _, want := range []string{`"user_agent":""`, `"client_version":""`, `"client_version_global":""`,
-		`"cli_version":""`, `"cli_version_global":""`} {
+		`"cli_version":""`, `"cli_version_global":""`, `"models_probe_ua_cn":""`, `"models_probe_ua_global":""`} {
 		if !strings.Contains(empty, want) {
 			t.Errorf("留空未下发 %s（载荷=%s）", want, empty)
 		}
 	}
 
 	// 显式值：原样透传。
-	filled := run(`{"user_agent":"Custom/1.0","client_version":"5.8.3","client_version_global":"5.8.4","cli_version":"2.161.0","cli_version_global":"2.170.0"}`)
+	filled := run(`{"user_agent":"Custom/1.0","client_version":"5.8.3","client_version_global":"5.8.4","cli_version":"2.161.0","cli_version_global":"2.170.0","models_probe_ua_cn":"CLI/2.171.0 CodeBuddy/2.171.0","models_probe_ua_global":"X/1"}`)
 	for _, want := range []string{`"user_agent":"Custom/1.0"`, `"client_version":"5.8.3"`, `"client_version_global":"5.8.4"`,
-		`"cli_version":"2.161.0"`, `"cli_version_global":"2.170.0"`} {
+		`"cli_version":"2.161.0"`, `"cli_version_global":"2.170.0"`,
+		`"models_probe_ua_cn":"CLI/2.171.0 CodeBuddy/2.171.0"`, `"models_probe_ua_global":"X/1"`} {
 		if !strings.Contains(filled, want) {
 			t.Errorf("显式值未透传 %s（载荷=%s）", want, filled)
 		}

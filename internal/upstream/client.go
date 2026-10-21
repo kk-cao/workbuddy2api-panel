@@ -787,6 +787,13 @@ type Client struct {
 	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认（官方内置 CLI 2.161.0）。
 	CliVersion string
 
+	// ModelsProbeUACN / ModelsProbeUAGlobal /v3/config 目录探测专用 UA 覆盖。
+	// 空 = 内置默认：CN 用 codeBuddyIDEUA、global 用与 chat 相同的 desktop UA。
+	// 注意：该端点只认 UA 的产品前缀（WorkBuddy/、CodeBuddyIDE/、CLI/），
+	// 换前缀会改变下发目录；版本号不影响内容。
+	ModelsProbeUACN     string
+	ModelsProbeUAGlobal string
+
 	// ClientVersionGlobal / CliVersionGlobal 国际版（global realm）专用版本段。
 	// CN 与 intl 两条独立发版线（2026-10：CN 5.8.3 / intl 5.8.4），留空时 global
 	// 账号回落 defaultClientVersionGlobal / defaultCliVersionGlobal。
@@ -1641,7 +1648,7 @@ func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
 	// 列表会从 22 条干净目录膨胀到 51 条、其中约 8 条是死条目。
 	// 权衡后保留 IDE 探测：该端点 1 小时才拉一次，多一种身份的暴露面远小于
 	// "模型列表里塞一半打不通的模型"。若上游开始按账号做 UA 一致性校验，再评估。
-	byID, err := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA)
+	byID, err := c.fetchV3ConfigModelMap(a, c.modelsProbeUA(a))
 	if err != nil {
 		return nil, err
 	}

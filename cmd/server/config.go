@@ -157,6 +157,11 @@ type Config struct {
 		ClientVersion string `json:"client_version"`
 		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（官方内置 CLI 2.161.0）。
 		CliVersion string `json:"cli_version"`
+		// ModelsProbeUACN / ModelsProbeUAGlobal /v3/config 目录探测专用 UA 覆盖。
+		// 空 = 内置默认（CN: CodeBuddyIDE/…；global: 与 chat 相同的 desktop UA）。
+		// 该端点按 UA 的**产品前缀**下发不同目录，换前缀会改变模型列表；版本号不影响。
+		ModelsProbeUACN     string `json:"models_probe_ua_cn"`
+		ModelsProbeUAGlobal string `json:"models_probe_ua_global"`
 		// ClientVersionGlobal 国际版（global realm）专用客户端版本段。
 		// CN 与 intl 两条独立发版线（2026-10：CN 5.8.3 / intl 5.8.4）。空 = 内置默认 5.8.4。
 		ClientVersionGlobal string `json:"client_version_global"`
@@ -465,6 +470,12 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_CLI_VERSION_GLOBAL"); v != "" {
 		c.Upstream.CliVersionGlobal = v
+	}
+	if v := os.Getenv("WB2A_MODELS_PROBE_UA_CN"); v != "" {
+		c.Upstream.ModelsProbeUACN = v
+	}
+	if v := os.Getenv("WB2A_MODELS_PROBE_UA_GLOBAL"); v != "" {
+		c.Upstream.ModelsProbeUAGlobal = v
 	}
 	if v := os.Getenv("WB2A_CLIENT_NAME"); v != "" {
 		c.Upstream.ClientName = v

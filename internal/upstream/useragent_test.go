@@ -363,3 +363,32 @@ func TestUserAgentRealmVersions(t *testing.T) {
 		t.Errorf("CN UA must ignore global override, got %q want %q", got, want)
 	}
 }
+
+// TestModelsProbeUAPrecedence 目录探测 UA 的取值优先级：
+// config 覆盖（按 realm）> 内置默认（CN: IDE 身份；global: 与 chat 同身份）。
+// 该端点按产品前缀下发不同目录，故默认值刻意与 chat 不同，但必须可被配置覆盖。
+func TestModelsProbeUAPrecedence(t *testing.T) {
+	cn := &auth.Auth{AccessToken: "at", UID: "u1", Domain: "copilot.tencent.com"}
+	gl := &auth.Auth{AccessToken: "at", UID: "u2", Domain: "www.workbuddy.ai"}
+	c := &Client{}
+
+	if got := c.modelsProbeUA(cn); got != codeBuddyIDEUA {
+		t.Errorf("CN 默认探测 UA = %q want %q", got, codeBuddyIDEUA)
+	}
+	if got, want := c.modelsProbeUA(gl), c.defaultWorkBuddyUAFor(gl); got != want {
+		t.Errorf("global 默认探测 UA = %q want %q（应与 chat 同身份）", got, want)
+	}
+
+	c.ModelsProbeUACN = "CLI/2.171.0 CodeBuddy/2.171.0"
+	if got := c.modelsProbeUA(cn); got != "CLI/2.171.0 CodeBuddy/2.171.0" {
+		t.Errorf("CN 覆盖后 = %q", got)
+	}
+	if got, want := c.modelsProbeUA(gl), c.defaultWorkBuddyUAFor(gl); got != want {
+		t.Errorf("CN 覆盖不应影响 global: %q want %q", got, want)
+	}
+
+	c.ModelsProbeUAGlobal = "ProbeGlobal/1.0"
+	if got := c.modelsProbeUA(gl); got != "ProbeGlobal/1.0" {
+		t.Errorf("global 覆盖后 = %q", got)
+	}
+}

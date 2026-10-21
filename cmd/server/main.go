@@ -160,6 +160,8 @@ func main() {
 	up.CliVersion = cfg.Upstream.CliVersion
 	up.ClientVersionGlobal = cfg.Upstream.ClientVersionGlobal
 	up.CliVersionGlobal = cfg.Upstream.CliVersionGlobal
+	up.ModelsProbeUACN = cfg.Upstream.ModelsProbeUACN
+	up.ModelsProbeUAGlobal = cfg.Upstream.ModelsProbeUAGlobal
 	up.ClientName = cfg.Upstream.ClientName
 	up.DeviceToken = cfg.Upstream.DeviceToken
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
@@ -584,7 +586,8 @@ func restartRequiredFields(c *Config) []string {
 	out = append(out, "upstream.user_agent")
 	// 版本段同样只在装配期写进出站 client（请求路径并发读取），热改无效。
 	out = append(out, "upstream.client_version", "upstream.cli_version",
-		"upstream.client_version_global", "upstream.cli_version_global")
+		"upstream.client_version_global", "upstream.cli_version_global",
+		"upstream.models_probe_ua_cn", "upstream.models_probe_ua_global")
 	// cn.chat_base 同样只在装配期写进 up.ChatBaseCN（请求路径并发读取，不做热改）。
 	out = append(out, "cn.chat_base")
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
