@@ -3,6 +3,7 @@
 package auth
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -209,6 +210,41 @@ func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 // 无需加锁——Realm() 加锁是因为 realm/Domain 会被 RefreshToken 在锁内改写。
 func (a *Auth) IsEnterprise() bool { return strings.TrimSpace(a.EnterpriseID) != "" }
 
+// jwtTokenSource 解出 JWT payload 中的 token_source 声明；非 JWT / 解码失败
+// 一律返回 ""（老 token 与非标准形态按无此声明处理，零回归）。先按无填充
+// base64url 解（JWT 标准），失败再试带填充形态（兼容非标准签发方）。
+func jwtTokenSource(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		if raw, err = base64.URLEncoding.DecodeString(parts[1]); err != nil {
+			return ""
+		}
+	}
+	var payload struct {
+		TokenSource string `json:"token_source"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	return payload.TokenSource
+}
+
+// TokenSource 从 AccessToken 的 JWT payload 里读 token_source 声明（官方客户端用它
+// 填出站 X-Auth-Method 与 X-Userinfo.token_source）。非 JWT / 无该声明 / 解码失败一律
+// 返回空串——空表示「这个账号没有该维度」，调用方随之不发对应头（不伪造）。
+//
+// 每次现解码而不缓存：RefreshToken 会整体换发 token，token_source 可能随重新授权翻转。
+// 成本是一次 base64 + 小 JSON，相对一次上游请求可忽略。
+func (a *Auth) TokenSource() string {
+	if a == nil {
+		return ""
+	}
+	return strings.TrimSpace(jwtTokenSource(a.AccessTokenValue()))
+}
 // isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。
 // 同时接受裸域 workbuddy.ai 与任意子域（HasSuffix("www.workbuddy.ai") 或裸域本身）。
 func isGlobalDomain(d string) bool {
