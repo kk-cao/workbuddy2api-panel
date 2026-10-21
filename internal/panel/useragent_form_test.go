@@ -51,6 +51,25 @@ func TestUserAgentVersionFormWiring(t *testing.T) {
 		}
 	}
 
+	// 布局：每个维度一行，左 CN、右国际版。用 HTML 里字段出现顺序钉住，
+	// 防止以后插入新字段时又把同一维度拆到两行（用户已反馈过一次顺序混乱）。
+	order := []string{
+		`name="client_version"`, `name="client_version_global"`,
+		`name="cli_version"`, `name="cli_version_global"`,
+		`name="models_probe_ua_cn"`, `name="models_probe_ua_global"`,
+	}
+	prev := -1
+	for _, marker := range order {
+		idx := strings.Index(string(html), marker)
+		if idx < 0 {
+			t.Fatalf("index.html 缺少 %s", marker)
+		}
+		if idx < prev {
+			t.Errorf("字段顺序错误：%s 出现在前一字段之前（应左 CN、右国际版）", marker)
+		}
+		prev = idx
+	}
+
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node not installed; collectConfig assembly test skipped")
