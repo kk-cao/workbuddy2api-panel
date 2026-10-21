@@ -356,9 +356,18 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 		convReqID = session.NewMessageID()
 	}
 	messageID := session.NewMessageID()
-	if meta.ConversationID != "" {
-		req.Header.Set("X-Conversation-ID", meta.ConversationID)
+	// X-Conversation-ID 必须**恒发**：2026-10-20 真机 A/B 实测（global 账号，同一
+	// token/body，只动这一个头）——缺失时上游 400 code=11-128 "request illegal"，
+	// 补任意非空值即 200；只补 conversation-request-id / message-id 而缺这个头同样
+	// 11-128。历史实现「入站没带就不伪造」，于是 passthrough 客户端（body 无会话键）
+	// 的每一次请求都必然被通道校验拒绝，账号被反复计成 channel refused（issue #231
+	// 的真实机制）。无真值可透传时用轮级聚合键兜底：语义上是「这条对话轮」，比空值
+	// 正确，也不跨请求伪造同一个会话。
+	convID := meta.ConversationID
+	if convID == "" {
+		convID = convReqID
 	}
+	req.Header.Set("X-Conversation-ID", convID)
 	req.Header.Set("X-Conversation-Request-ID", convReqID)
 	req.Header.Set("X-Conversation-Message-ID", messageID)
 	req.Header.Set("X-Request-ID", messageID)

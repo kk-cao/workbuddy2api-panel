@@ -1,6 +1,7 @@
 package server
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -133,5 +134,43 @@ func TestIssue231TrueRestrictionEndToEndDisables(t *testing.T) {
 	}
 	if !strings.Contains(st.Reason, "11140") {
 		t.Fatalf("disable reason must keep the business code: %q", st.Reason)
+	}
+}
+
+// TestIssue231OutboundAlwaysCarriesConversationID 回归守卫：
+// 入站 body 没有会话键（passthrough 客户端常态）时，出站仍必须带
+// X-Conversation-ID。缺失该头上游直接 400 11-128（2026-10-20 真机 A/B 实测），
+// 这正是 issue #231「网页能聊、面板全禁用」的真实机制。
+func TestIssue231OutboundAlwaysCarriesConversationID(t *testing.T) {
+	var got http.Header
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			got = r.Header.Clone()
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "a", AccessToken: "at-a", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	// 无 conversation_id / conversation 字段的 passthrough body。
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
+	}
+	for _, name := range []string{"X-Conversation-ID", "X-Conversation-Request-ID", "X-Conversation-Message-ID"} {
+		if got.Get(name) == "" {
+			t.Fatalf("%s missing on outbound request (headers=%v)", name, got)
+		}
+	}
+	if got.Get("X-Conversation-ID") != got.Get("X-Conversation-Request-ID") {
+		t.Logf("conversation id differs from request id (allowed, both non-empty)")
 	}
 }
