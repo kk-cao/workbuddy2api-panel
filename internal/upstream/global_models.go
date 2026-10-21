@@ -204,9 +204,11 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 	// 桌面端 UA（主路）：项目 chat 路径实际使用的 UA，与官方客户端看到的目录同源。
 	// 按账号 realm 生成（平台段两个 realm 同为 `WorkBuddy`，仅版本段随 realm 变），
 // 故必须传 a 而非用常量。
+	// 只探桌面端一路：与 chat 同身份。
+	// 此前并发 IDE/CLI 两路取并集（多拿 auto-chat / deep-model / o4-mini /
+	// enhance-1.0 等 4 个 chat 模型），代价是同一账号秒级出现三种客户端身份。
+	// 若日后需要这些模型，恢复对应 probeV3(...) 行并在下方 mergeV3Routes 里加回。
 	v3DesktopCh := probeV3(c.defaultWorkBuddyUAFor(a))
-	v3IDECh := probeV3(codeBuddyIDEUA)
-	v3CLICh := probeV3(codeBuddyCLIUA)
 	enterpriseCh := make(chan probeResult, 1)
 	go func() {
 		// 企业端点家族：/v2 首选 → /console 兜底（既有探活序，零回归）。
@@ -223,8 +225,6 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 		enterpriseCh <- probeResult{err: lastErr}
 	}()
 	v3Desktop := <-v3DesktopCh
-	v3IDE := <-v3IDECh
-	v3CLI := <-v3CLICh
 	enterprise := <-enterpriseCh
 	// v3 三路自合并：桌面端路字段权威（主路），IDE/CLI 只补主路缺失的模型 id
 	// （只补 id，字段仍取自各自条目——主路没有该 id 时才轮到它们）。
@@ -234,8 +234,6 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 		res   probeResult
 	}{
 		{"desktop-UA", v3Desktop},
-		{"IDE-UA", v3IDE},
-		{"CLI-UA", v3CLI},
 	})
 
 	if v3.err != nil && enterprise.err != nil {

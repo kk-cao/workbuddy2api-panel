@@ -1631,6 +1631,14 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 // nonChatModel 规则剔除非对话条目（selected 会选模型报 code=11102）。
 // 失败返回错误（调用方降级为仅企业端点）。
 func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
+	// 目录探测仍用 codeBuddyIDEUA（CodeBuddyIDE/4.12.0）。
+	//
+	// 试过改用 desktop UA 与 chat 统一身份，实测代价不可接受：CN 桌面端目录返回
+	// 62 条原始模型，比 IDE 目录多出 gpt-6-astra / gemini-3.8-flash / grok-4.7 /
+	// auto-chat 等 **CN 基址根本不存在的模型**（调用直接 400 model_unavailable），
+	// 列表会从 22 条干净目录膨胀到 51 条、其中约 8 条是死条目。
+	// 权衡后保留 IDE 探测：该端点 1 小时才拉一次，多一种身份的暴露面远小于
+	// "模型列表里塞一半打不通的模型"。若上游开始按账号做 UA 一致性校验，再评估。
 	byID, err := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA)
 	if err != nil {
 		return nil, err
