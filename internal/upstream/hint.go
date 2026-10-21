@@ -55,6 +55,11 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		return "rate limited by upstream; retry after reset"
 	case ErrAccountFault:
 		return "account-level fault at upstream (auth/quota state); the gateway will rotate or disable this account"
+	case ErrChannelRefused:
+		// 请求通道校验失败是客户端侧形状问题（首条消息非 system / 缺会话头 /
+		// 非官方客户端指纹），账号本身健康：指向可操作的排查方向，不要让用户去
+		// 重登或申诉账号。
+		return "upstream rejected this request channel (11-128); the account is healthy — check the request shape (first message should be role=system, and use official-client headers)"
 	case ErrSessionDead:
 		return "account session expired at upstream; the account is disabled until re-login"
 	case ErrHardCredit:

@@ -846,6 +846,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				kind = upstream.Classify(status, string(respBody))
 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			}
+			// 通道校验失败（业务码 11-128）：账号本身健康——上游 displayTips 说的是
+			// 「这次调用没通过渠道校验，可能不是官方客户端发出的」，同一账号官方客户端
+			// 可正常聊天。故这里**绝不罚号**（无冷却/熔断/NoteFailures/Disable），也
+			// **不轮转**：通道指纹是「出口 IP + 出站头部 + 请求体形状」的组合，换号不
+			// 改变它，轮转只会把同一份无效请求放大 MaxRotate 倍、每号各交一次配额，
+			// 末端还落成 503 no_healthy_account，把确定性的客户端侧问题伪装成服务端
+			// 过载。透传上游原文回 400，客户端据此修请求形状。
+			if kind == upstream.ErrChannelRefused {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "upstream rejected this request channel (11-128)"
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "channel_refused", msg,
+					h.hintOf(upstream.ErrChannelRefused, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
 			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append
 			// 降级重试同样退化为 replace——原文在场只会确定性再撞 400）。
@@ -1338,17 +1358,29 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
+	case upstream.ErrChannelRefused:
+		// 11-128 通道校验失败：请求形状没过官方渠道校验，账号本身健康。零动作
+		// （不冷却/不熔断/不 NoteFailures）——罚一个健康账号只会让可用池越来越小，
+		// 而同账号的官方客户端始终被放行。chatCompletions 已 fail-fast 透传 400。
 	case upstream.ErrAccountFault:
-		// 账号级授权/配额故障按 msg 分野（口径与 Classify 的 accountFaultMarkers 一致）：
-		//   - "request illegal"（code 11140）→ 账号级**授权封禁**：硬禁用（Disable）。
-		//   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
-		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
-		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
-		if strings.Contains(strings.ToLower(body), "request illegal") {
-			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
+		// 账号级授权限制的**唯一**判据是结构化业务码 + 文案 + 语义三条件
+		// （IsAccountRestricted：11140 & "request illegal" & 无限流文案）。
+		// 旧实现只匹配 msg "request illegal"，于是 code 11-128 的通道校验失败
+		// （msg 恰好同为 "request illegal"）也被当成 11140 封禁并 Disable，
+		// 健康账号被永久踢出池子（issue #231）。历史被误标账号的 reason 文案正是
+		// 这一句，可作为该 bug 的化石证据。
+		if upstream.IsChannelRefused(body) {
+			return // 防御：分类层已归 ErrChannelRefused，绝不在此罚号
+		}
+		if upstream.IsAccountRestricted(body) {
+			// 真封禁：保留禁用，并尽量把上游 requestId 写进 reason 作为原始错误依据。
+			h.cfg.Pool.Disable(uid, upstream.AccountRestrictionReason(body))
 			return
 		}
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (14017)")
+		// 其余账号级故障（14017 trial not activated）与「11140 + 模型限流说明」的
+		// 变体：register 未完成/限流都可自愈，**保持软冷却**（禁用会让用户补完
+		// register、或几分钟限流过去后仍无法用）。
+		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (non-restriction)")
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
