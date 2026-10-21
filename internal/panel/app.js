@@ -264,6 +264,10 @@ function rateLimitMeta(row, now) {
     };
   }
   const title = [model, resetAt ? '上游重置：' + fmtLocalDateTime(resetAt) : '上游重置：时间未知'];
+  // 必须显式声明：本文件是 'use strict'，下面两个分支的 `detail = …` 若不声明
+  // 会抛 ReferenceError，导致 rateLimitMeta 整体失败、renderAccounts 中断、
+  // 账号池表格整张空白（有任一软限流行时必现）。
+  let detail;
   if (until && resetAt && until < resetAt) {
     // 双时钟（issue #171 问题二）：黄框出现/消失由 until 决定（网关为防超长
     // 限流拖死全池，把重试封顶在 now+softRateMax），主文字却按 resetAt 显示，
