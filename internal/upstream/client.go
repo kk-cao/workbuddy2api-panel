@@ -1449,11 +1449,13 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 }
 
 // codeBuddyIDEUA /v3/config 要求能解析出 CodeBuddy 版本号的 UA。
+// 版本号跟官方 IDE 发版走（当前 4.12.2，2026-10-14）；版本段不影响目录内容，
+// 只影响画像真实度（实测 4.12.0 / 4.20.0 / 5.0.0 / 5.8.3 都返回 24 条）。
 // CLI 三段式 WorkBuddy UA 会拿到精简目录（flash 输出 128K、无 supportedEfforts）；
 // 官方 IDE 头 `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0` 才返回完整能力
 // （flash：393216 + low/high/max）。
 // 版本号需随上游 IDE 发版跟进：UAn 版本过旧时该端点可能同样返回精简目录。
-const codeBuddyIDEUA = "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0"
+const codeBuddyIDEUA = "CodeBuddyIDE/4.12.2 CodeBuddy/4.12.2"
 
 // codeBuddyCLIUA CLI 三段式 UA。**实测（2026-09-22）该端点对不同 UA 下发的模型集合不同**：
 //   - IDE UA  → 14 条（10 个 chat：含 o4-mini / enhance-1.0 / auto-chat，**无 deepseek 系列**）
@@ -1465,7 +1467,7 @@ const codeBuddyIDEUA = "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0"
 //     但 **IDE 响应体积更大**（26003B vs 21111B），故「完整能力」应理解为**单条字段更全**，
 //     而非模型更多。两路各有独有模型，缺一不可。
 //  2. 该常量仅用于 global 侧第二路探测；CN 侧仍走 codeBuddyIDEUA 单路。
-const codeBuddyCLIUA = "CLI/2.63.2 CodeBuddy/2.63.2"
+const codeBuddyCLIUA = "CLI/2.171.0 CodeBuddy/2.171.0"
 
 // FetchModels 调上游动态模型接口（CN 侧；global 账号见 global_models.go 家族）。
 //
@@ -1906,8 +1908,10 @@ func v3ConfigDomain(a *auth.Auth, chatBase string) string {
 
 // fetchV3ConfigModelMap 拉官方 IDE 配置目录，按模型 id 建能力表。
 // 该端点对 UA 敏感：必须带 CodeBuddy/CodeBuddyIDE 版本，否则 400 code=12403。
-// ua 为该次请求的 User-Agent；空串等价 codeBuddyIDEUA。该端点对 UA 敏感且**不同 UA 下发
-// 不同模型集合**（见 codeBuddyCLIUA 注释），global 探测据此并发两路取并集。
+// ua 为该次请求的 User-Agent；空串等价 codeBuddyIDEUA。该端点对 UA 的**产品前缀**
+// 敏感（WorkBuddy/、CodeBuddyIDE/、CLI/ 三族各下发不同目录），但**版本号不影响结果**
+// （实测 4.12.0 与 5.8.3 同为 24 条，CLI 2.63.2 与 2.171.0 同为 35 条）。
+// 因此版本段可以安全跟随官方发版更新，只影响"客户端画像"的真实度。
 func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]ModelInfo, error) {
 	req, err := http.NewRequest(http.MethodGet, c.chatBase(a)+"/v3/config", nil)
 	if err != nil {
