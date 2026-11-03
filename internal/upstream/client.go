@@ -781,10 +781,10 @@ type Client struct {
 	UserAgent string
 
 	// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` + X-IDE-Version）。
-	// 空 = 内置默认（对齐官方 5.5.4 分发包）。
+	// 空 = 内置默认（对齐官方 5.9.3 分发包）。
 	ClientVersion string
 
-	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认（官方内置 CLI 2.161.0）。
+	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认（官方内置 CLI 2.165.0）。
 	CliVersion string
 
 	// ModelsProbeUACN / ModelsProbeUAGlobal /v3/config 目录探测专用 UA 覆盖。
@@ -795,7 +795,7 @@ type Client struct {
 	ModelsProbeUAGlobal string
 
 	// ClientVersionGlobal / CliVersionGlobal 国际版（global realm）专用版本段。
-	// CN 与 intl 两条独立发版线（2026-10：CN 5.8.3 / intl 5.8.4），留空时 global
+	// CN 与 intl 两条独立发版线（2026-11：CN 5.9.3 / intl 5.9.4），留空时 global
 	// 账号回落 defaultClientVersionGlobal / defaultCliVersionGlobal。
 	// 通用 ClientVersion 非空时仍优先于 realm 默认（显式覆盖语义不变）。
 	ClientVersionGlobal string
@@ -1474,7 +1474,7 @@ const codeBuddyIDEUA = "CodeBuddyIDE/4.12.2 CodeBuddy/4.12.2"
 //     但 **IDE 响应体积更大**（26003B vs 21111B），故「完整能力」应理解为**单条字段更全**，
 //     而非模型更多。两路各有独有模型，缺一不可。
 //  2. 该常量仅用于 global 侧第二路探测；CN 侧仍走 codeBuddyIDEUA 单路。
-const codeBuddyCLIUA = "CLI/2.171.0 CodeBuddy/2.171.0"
+const codeBuddyCLIUA = "CLI/2.179.3 CodeBuddy/2.179.3"
 
 // FetchModels 调上游动态模型接口（CN 侧；global 账号见 global_models.go 家族）。
 //

@@ -1,11 +1,11 @@
-// desktop.go 桌面客户端（WorkBuddy Desktop 5.8.3）行为指纹上报。
+// desktop.go 桌面客户端（WorkBuddy Desktop 5.9.3）行为指纹上报。
 //
 // 来源：2026-09-12 Sunny 抓包实测（data/desktop-task-protocol.md）。桌面端点亮
 // 「需电脑端」类任务的关键不是独立端点，而是同一 POST /v2/report 通道上
 // **不同的客户端指纹**：
 //
 //	POST https://copilot.tencent.com/v2/report        ← chatBase（CLI 上报走 billingBase）
-//	User-Agent: WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0
+//	User-Agent: WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0
 //	X-Domain: copilot.tencent.com, X-Product: SaaS, X-User-Id: <uid>
 //	Body: [ {...event...} ]                           ← 数组
 //
@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -39,8 +40,8 @@ import (
 const (
 	desktopReportPath    = "/v2/report"
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
-	// desktopUA 实测桌面客户端 UA（5.8.3 内嵌 CLI 2.161.0）。
-	desktopUA = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
+	// desktopUA 实测桌面客户端 UA（5.9.3 内嵌 CLI 2.165.0）。
+	desktopUA = "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"
 )
 
 // desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（copilot.tencent.com）。
@@ -48,7 +49,12 @@ func (c *Client) desktopBase(a *auth.Auth) string { return c.chatBase(a) }
 
 // deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/qimei36 复用），
 // 幂等：同一账号每次生成相同值，模拟固定设备。
+// 当 salt == "machine" || salt == "session" 时复用 deriveAccountStableID(a.UID, salt)，
+// 确保桌面事件载荷中的 machineId/sessionId 与出站请求头 X-Machine-ID / X-Session-ID 完全一致。
 func deriveID(a *auth.Auth, salt string) string {
+	if salt == "machine" || salt == "session" {
+		return deriveAccountStableID(a.UID, salt)
+	}
 	sum := sha256.Sum256([]byte(salt + ":" + a.UID))
 	return hex.EncodeToString(sum[:18]) // 36 hex chars
 }
@@ -66,15 +72,15 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 		"username":     a.Nickname,
 		"userNickname": a.Nickname,
 		"product":      "SaaS",
-		"releaseDate":  int64(1792029852000),
-		"commit":       "db0e9b51b7fa0b383f41f5b0b83dd442c8557918",
+		"releaseDate":  int64(1793093050922),
+		"commit":       "d46924219e79332f49c37ccebf27292f87001b19",
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
-		"ideVersion":   "5.8.3",
+		"ideVersion":   "5.9.3",
 		"machineId":    deriveID(a, "machine"),
 		"sessionId":    deriveID(a, "session"),
 		"extName":      "workbuddy-desktop",
-		"extVersion":   "5.8.3",
+		"extVersion":   "5.9.3",
 		"os":           "win32",
 		"arch":         "x64",
 		"osVersion":    "10.0.26220",
@@ -93,6 +99,11 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 		return fmt.Errorf("desktop report: no events")
 	}
 	fp := desktopFingerprint(a)
+	if c != nil {
+		ver := c.clientVersionFor(a)
+		fp["ideVersion"] = ver
+		fp["extVersion"] = ver
+	}
 	arr := make([]map[string]any, 0, len(events))
 	for _, ev := range events {
 		m := map[string]any{}
@@ -115,13 +126,18 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUA)
-	req.Header.Set("X-Domain", c.desktopBase(a))
+	req.Header.Set("User-Agent", c.userAgent(a))
+	domain := strings.TrimPrefix(strings.TrimPrefix(c.desktopBase(a), "https://"), "http://")
+	req.Header.Set("X-Domain", domain)
 	req.Header.Set("X-Product", "SaaS")
 	req.Header.Set("X-Request-ID", deriveID(a, "req")+fmt.Sprintf("%d", time.Now().UnixNano()%1e6))
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
+	c.injectCodeBuddyRequest(req)
+	req.Header.Set("Accept-Language", acceptLanguageFor(a))
+	c.injectAccountStableHeaders(req, a)
+	c.injectDeviceToken(req, a)
 	_, err = c.doJSON(req)
 	return err
 }
@@ -441,8 +457,8 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	h.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "text/event-stream")
-	h.Set("User-Agent", desktopUA)
-	h.Set("X-Domain", c.chatBase(a))
+	h.Set("User-Agent", c.userAgent(a))
+	h.Set("X-Domain", strings.TrimPrefix(strings.TrimPrefix(c.chatBase(a), "https://"), "http://"))
 	h.Set("X-Product", "SaaS")
 	h.Set("X-User-Id", a.UID)
 	h.Set("X-Conversation-ID", conversationID)
@@ -451,7 +467,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	h.Set("X-Agent-Type", "main")
 	h.Set("X-IDE-Name", "WorkBuddy")
 	h.Set("X-IDE-Type", "WorkBuddy")
-	h.Set("X-IDE-Version", "5.8.3")
+	h.Set("X-IDE-Version", c.clientVersionFor(a))
 	h.Set("x-codebuddy-request", "1")
 	if expertID != "" {
 		h.Set("X-Expert-Id", expertID)

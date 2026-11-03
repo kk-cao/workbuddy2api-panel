@@ -153,9 +153,9 @@ type Config struct {
 		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
 		UserAgent string `json:"user_agent"`
 		// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` 与归属头
-		// X-IDE-Version）。空 = 内置默认（对齐官方 5.5.4 分发包）。
+		// X-IDE-Version）。空 = 内置默认（对齐官方 5.9.3 分发包）。
 		ClientVersion string `json:"client_version"`
-		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（官方内置 CLI 2.161.0）。
+		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（官方内置 CLI 2.165.0）。
 		CliVersion string `json:"cli_version"`
 		// ModelsProbeUACN / ModelsProbeUAGlobal /v3/config 目录探测专用 UA 覆盖。
 		// 空 = 内置默认（CN: CodeBuddyIDE/…；global: 与 chat 相同的 desktop UA）。
@@ -163,9 +163,9 @@ type Config struct {
 		ModelsProbeUACN     string `json:"models_probe_ua_cn"`
 		ModelsProbeUAGlobal string `json:"models_probe_ua_global"`
 		// ClientVersionGlobal 国际版（global realm）专用客户端版本段。
-		// CN 与 intl 两条独立发版线（2026-10：CN 5.8.3 / intl 5.8.4）。空 = 内置默认 5.8.4。
+		// CN 与 intl 两条独立发版线（2026-11：CN 5.9.3 / intl 5.9.4）。空 = 内置默认 5.9.4。
 		ClientVersionGlobal string `json:"client_version_global"`
-		// CliVersionGlobal 国际版专用 `CLI/<ver>` 段。空 = 内置默认 2.161.0。
+		// CliVersionGlobal 国际版专用 `CLI/<ver>` 段。空 = 内置默认 2.165.0。
 		CliVersionGlobal string `json:"cli_version_global"`
 		// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
 		// 空 = 旧行为 X-Product="SaaS" 不设 X-IDE-*；配 "WorkBuddy" 则四头跟随。

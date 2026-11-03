@@ -14,21 +14,21 @@ import (
 
 const (
 	// defaultClientVersion 出站 WorkBuddy 客户端版本段（UA 的 `WorkBuddy/<ver>` 与
-	// 白名单头组的 X-IDE-Version）。对齐官方 WorkBuddy Desktop 分发包版本（5.8.3，
+	// 白名单头组的 X-IDE-Version）。对齐官方 WorkBuddy Desktop 分发包版本（5.9.3，
 	// 实测安装包 product.json 的 genieVersion 与 About 窗口一致）。
 	// config upstream.client_version 可覆盖（空 = 内置默认）。
-	defaultClientVersion = "5.8.3"
-	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐 5.8.3 桌面端**内置**的
-	// `@tencent-ai/codebuddy-code`（2.161.0，见 resources/app.asar.unpacked/cli）。
-	// 注意：它与独立安装的 CLI（npm 全局包，2026-10 已到 2.171.0）是两条发布线。
+	defaultClientVersion = "5.9.3"
+	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐 5.9.3 桌面端**内置**的
+	// `@tencent-ai/codebuddy-code`（2.165.0，见 resources/app.asar.unpacked/cli）。
+	// 注意：它与独立安装的 CLI（npm 全局包，2026-10 已到 2.179.3）是两条发布线。
 	// config upstream.cli_version 可覆盖（空 = 内置默认）。
-	defaultCliVersion = "2.161.0"
+	defaultCliVersion = "2.165.0"
 	// defaultClientVersionGlobal / defaultCliVersionGlobal 国际版（global realm）桌面分发包
-	// 版本段。CN 与 intl 是两条独立发版线：2026-10 实测 CN WorkBuddy 5.8.3（内嵌 CLI
-	// 2.161.0）、intl 5.8.4（同属 CLI 2.161.0 系列），故按账号 realm 分档，
+	// 版本段。CN 与 intl 是两条独立发版线：2026-11 实测 CN WorkBuddy 5.9.3（内嵌 CLI
+	// 2.165.0）、intl 5.9.4（同属 CLI 2.165.0 系列），故按账号 realm 分档，
 	// config upstream.client_version_global / cli_version_global 可覆盖。
-	defaultClientVersionGlobal = "5.8.4"
-	defaultCliVersionGlobal    = "2.161.0"
+	defaultClientVersionGlobal = "5.9.4"
+	defaultCliVersionGlobal    = "2.165.0"
 
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
@@ -62,7 +62,7 @@ func (c *Client) cliVersion() string {
 
 // clientVersionFor 按账号 realm 取生效的 WorkBuddy 客户端版本段。
 // 优先级：realm 专用显式配置（仅 global）> 通用显式配置 > realm 内置默认。
-// 背景：CN 与 intl 是两条独立发版线，同一时刻版本号不同（2026-10：5.8.3 / 5.8.4）；
+// 背景：CN 与 intl 是两条独立发版线，同一时刻版本号不同（2026-11：5.9.3 / 5.9.4）；
 // 用单一版本号会让其中一侧的 UA 与实际安装包不符。
 func (c *Client) clientVersionFor(a *auth.Auth) string {
 	global := a != nil && a.IsGlobal()

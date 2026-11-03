@@ -15,11 +15,13 @@ import (
 func TestReportDesktopEventFingerprint(t *testing.T) {
 	var got []map[string]any
 	var gotUA string
+	var gotHdr http.Header
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v2/report" {
 			t.Errorf("path=%s want /v2/report", r.URL.Path)
 		}
 		gotUA = r.Header.Get("User-Agent")
+		gotHdr = r.Header.Clone()
 		if r.Header.Get("X-User-Id") != "u-dt" {
 			t.Errorf("X-User-Id=%q want u-dt", r.Header.Get("X-User-Id"))
 		}
@@ -35,13 +37,22 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL}
-	err := c.ReportDesktopEvent(&auth.Auth{AccessToken: "at", UID: "u-dt", Nickname: "RenJie"},
+	err := c.ReportDesktopEvent(&auth.Auth{AccessToken: "at", UID: "u-dt", Nickname: "RenJie", DeviceToken: "dt-1"},
 		DesktopEvent{"eventCode": "agent_task_created", "mode": "craft"})
 	if err != nil {
 		t.Fatalf("report desktop: %v", err)
 	}
 	if gotUA != desktopUA {
 		t.Errorf("UA=%q want %q", gotUA, desktopUA)
+	}
+	if gotHdr.Get("X-CodeBuddy-Request") != "1" {
+		t.Errorf("X-CodeBuddy-Request=%q want 1", gotHdr.Get("X-CodeBuddy-Request"))
+	}
+	if gotHdr.Get("Accept-Language") != "zh-CN" {
+		t.Errorf("Accept-Language=%q want zh-CN", gotHdr.Get("Accept-Language"))
+	}
+	if gotHdr.Get("X-Device-Token") != "dt-1" {
+		t.Errorf("X-Device-Token=%q want dt-1", gotHdr.Get("X-Device-Token"))
 	}
 	if len(got) != 1 {
 		t.Fatalf("events=%d want 1", len(got))
@@ -53,6 +64,9 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 	if ev["ideType"] != "WorkBuddy" || ev["ideName"] != "WorkBuddy" {
 		t.Errorf("ideType/ideName=%v/%v want WorkBuddy", ev["ideType"], ev["ideName"])
 	}
+	if ev["ideVersion"] != "5.9.3" || ev["extVersion"] != "5.9.3" {
+		t.Errorf("ideVersion/extVersion=%v/%v want 5.9.3", ev["ideVersion"], ev["extVersion"])
+	}
 	if ev["userId"] != "u-dt" {
 		t.Errorf("userId=%v want u-dt", ev["userId"])
 	}
@@ -62,9 +76,15 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 	if ev["mode"] != "craft" {
 		t.Errorf("业务字段 mode=%v 被指纹覆盖或缺失", ev["mode"])
 	}
-	// machineId 应为 uid 稳定派生（36 hex）。
+	// machineId / sessionId 应与请求头 X-Machine-ID / X-Session-ID 完全一致（36 hex）。
 	if len(ev["machineId"].(string)) != 36 {
 		t.Errorf("machineId 长度=%d want 36", len(ev["machineId"].(string)))
+	}
+	if ev["machineId"] != gotHdr.Get("X-Machine-ID") {
+		t.Errorf("ev.machineId=%v != X-Machine-ID=%q", ev["machineId"], gotHdr.Get("X-Machine-ID"))
+	}
+	if ev["sessionId"] != gotHdr.Get("X-Session-ID") {
+		t.Errorf("ev.sessionId=%v != X-Session-ID=%q", ev["sessionId"], gotHdr.Get("X-Session-ID"))
 	}
 }
 

@@ -1128,32 +1128,32 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </div>
             <div class="grid2">
               <label class="fld"><span class="lb">客户端版本（CN）</span>
-                <input name="client_version" placeholder="留空 = 5.8.3">
-                <span class="hint">UA 的 WorkBuddy 段 + <code>X-IDE-Version</code>；对应 CN 桌面端 5.8.3 安装包</span></label>
+                <input name="client_version" placeholder="留空 = 5.9.3">
+                <span class="hint">UA 的 WorkBuddy 段 + <code>X-IDE-Version</code>；对应 CN 桌面端 5.9.3 安装包</span></label>
               <label class="fld"><span class="lb">客户端版本（国际版）</span>
-                <input name="client_version_global" placeholder="留空 = 5.8.4">
-                <span class="hint">global 号专用；对应国际版 5.8.4 安装包，CN 号不受影响</span></label>
+                <input name="client_version_global" placeholder="留空 = 5.9.4">
+                <span class="hint">global 号专用；对应国际版 5.9.4 安装包，CN 号不受影响</span></label>
             </div>
             <div class="grid2">
               <label class="fld"><span class="lb">客户端 CLI 版本（CN）</span>
-                <input name="cli_version" placeholder="留空 = 2.161.0">
-                <span class="hint">UA 的 <code>CLI/</code> 段；5.8.3 桌面端<b>内置</b>的 CLI（非你本机 PATH 里那个 2.171.0）</span></label>
+                <input name="cli_version" placeholder="留空 = 2.165.0">
+                <span class="hint">UA 的 <code>CLI/</code> 段；5.9.3 桌面端<b>内置</b>的 CLI（非你本机 PATH 里那个 2.179.3）</span></label>
               <label class="fld"><span class="lb">客户端 CLI 版本（国际版）</span>
-                <input name="cli_version_global" placeholder="留空 = 2.161.0">
-                <span class="hint">global 号专用；国际版 5.8.4 内置 CLI 同样是 2.161.0</span></label>
+                <input name="cli_version_global" placeholder="留空 = 2.165.0">
+                <span class="hint">global 号专用；国际版 5.9.4 内置 CLI 同样是 2.165.0</span></label>
             </div>
             <div class="grid2">
               <label class="fld"><span class="lb">目录探测 UA（CN）</span>
                 <input name="models_probe_ua_cn" placeholder="留空 = CodeBuddyIDE/4.12.2 CodeBuddy/4.12.2">
                 <span class="hint">仅用于 <code>/v3/config</code> 拉模型目录；该端点按 UA 的<b>产品前缀</b>（<code>WorkBuddy/</code> <code>CodeBuddyIDE/</code> <code>CLI/</code>）下发不同目录，版本号不影响。换前缀会改模型列表，需重启</span></label>
               <label class="fld"><span class="lb">目录探测 UA（国际版）</span>
-                <input name="models_probe_ua_global" placeholder="留空 = 与聊天 UA 相同（WorkBuddy/5.8.4 …）">
+                <input name="models_probe_ua_global" placeholder="留空 = 与聊天 UA 相同（WorkBuddy/5.9.4 …）">
                 <span class="hint">global 号专用；留空时直接用聊天 UA（单一身份）。需重启</span></label>
             </div>
             <div class="grid2">
               <label class="fld"><span class="lb">当前生效形态</span>
-                <span class="hint">CN 号 → <code>WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0</code><br>
-                global 号 → <code>WorkBuddy/5.8.4 WorkBuddy/5.8.4 CLI/2.161.0</code><br>
+                <span class="hint">CN 号 → <code>WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0</code><br>
+                global 号 → <code>WorkBuddy/5.9.4 WorkBuddy/5.9.4 CLI/2.165.0</code><br>
                 以上四项留空时即为该值；平台段两个 realm 都是 <code>WorkBuddy</code>（安装包实测）。</span></label>
             </div>
             <div class="hr"></div>

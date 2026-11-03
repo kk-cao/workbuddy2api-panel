@@ -48,7 +48,7 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 			call: func(c *Client) error {
 				return c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u1"}, "cid", "")
 			},
-			wantUA: "WorkBuddy/5.8.3",
+			wantUA: "WorkBuddy/5.9.3",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -160,10 +160,10 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 // --- A 段：UA 对齐官方 WorkBuddy 三段式 ---
 
 const (
-	defaultUAString      = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
+	defaultUAString      = "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"
 	explicitString       = "MyCustomAgent/3.1"
-	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.161.0"
-	billingUAWorkBuddy   = "WorkBuddy/5.8.3"
+	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.165.0"
+	billingUAWorkBuddy   = "WorkBuddy/5.9.3"
 	billingUACustomVer   = "WorkBuddy/6.0.0"
 	billingUAAgentString = "BillingAgent/1"
 )
@@ -336,22 +336,22 @@ func TestBillingUA_WhenClientNameEmpty(t *testing.T) {
 var _ = io.Discard
 
 // TestUserAgentRealmVersions CN/global 按 realm 分档：两条独立发版线，UA 版本段与
-// 平台段都要跟着账号走（2026-10 实测：CN WorkBuddy 5.8.3 / intl 5.8.4，均内嵌 CLI 2.161.0）。
+// 平台段都要跟着账号走（2026-11 实测：CN WorkBuddy 5.9.3 / intl 5.9.4，均内嵌 CLI 2.165.0）。
 func TestUserAgentRealmVersions(t *testing.T) {
 	c := &Client{}
 	cn := &auth.Auth{AccessToken: "at", UID: "u1", Domain: "www.codebuddy.cn"}
 	gl := &auth.Auth{AccessToken: "at", UID: "u2", Domain: "www.workbuddy.ai"}
 
-	if got, want := c.userAgent(cn), "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"; got != want {
+	if got, want := c.userAgent(cn), "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"; got != want {
 		t.Errorf("CN UA = %q want %q", got, want)
 	}
-	if got, want := c.userAgent(gl), "WorkBuddy/5.8.4 WorkBuddy/5.8.4 CLI/2.161.0"; got != want {
+	if got, want := c.userAgent(gl), "WorkBuddy/5.9.4 WorkBuddy/5.9.4 CLI/2.165.0"; got != want {
 		t.Errorf("global UA = %q want %q", got, want)
 	}
 
 	// 通用显式覆盖仍优先于 realm 默认（显式语义不变）。
 	c2 := &Client{ClientVersion: "6.0.0"}
-	if got, want := c2.userAgent(gl), "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.161.0"; got != want {
+	if got, want := c2.userAgent(gl), "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.165.0"; got != want {
 		t.Errorf("global UA with explicit version = %q want %q", got, want)
 	}
 	// realm 专用覆盖只影响 global，不污染 CN。
@@ -359,7 +359,7 @@ func TestUserAgentRealmVersions(t *testing.T) {
 	if got, want := c3.userAgent(gl), "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/3.0.0"; got != want {
 		t.Errorf("global UA with realm override = %q want %q", got, want)
 	}
-	if got, want := c3.userAgent(cn), "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"; got != want {
+	if got, want := c3.userAgent(cn), "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"; got != want {
 		t.Errorf("CN UA must ignore global override, got %q want %q", got, want)
 	}
 }
