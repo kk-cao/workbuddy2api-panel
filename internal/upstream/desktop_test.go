@@ -139,3 +139,67 @@ func TestSetAppearanceTheme(t *testing.T) {
 		t.Errorf("body=%v want kind=theme resource_key=theme-tkmw7j", got)
 	}
 }
+
+// TestSetAppearanceThemeAndMarketExpertListHeaders 断言 SetAppearanceTheme 与 MarketExpertList 发送裸 X-Domain、X-CodeBuddy-Request: 1、X-Machine-ID 与 X-Session-ID。
+func TestSetAppearanceThemeAndMarketExpertListHeaders(t *testing.T) {
+	var gotHdr http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHdr = r.Header.Clone()
+		if r.URL.Path == "/portal/operation-platform/market/expert/list" {
+			w.Write([]byte(`{"code":0,"msg":"OK","data":{"experts":[{"expert_id":"e1","display_name_zh":"专家1"}]}}`))
+			return
+		}
+		w.Write([]byte(`{"code":0,"msg":"OK"}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL}
+	if err := c.SetAppearanceTheme(&auth.Auth{AccessToken: "at", UID: "u-theme"}, "theme-tkmw7j"); err != nil {
+		t.Fatalf("set theme: %v", err)
+	}
+	assertDesktopCommonHeaders(t, gotHdr, "u-theme")
+
+	experts, err := c.MarketExpertList(&auth.Auth{AccessToken: "at", UID: "u-exp"}, "agent")
+	if err != nil {
+		t.Fatalf("market expert list: %v", err)
+	}
+	if len(experts) != 1 || experts[0].ExpertID != "e1" {
+		t.Errorf("experts=%+v want [e1]", experts)
+	}
+	assertDesktopCommonHeaders(t, gotHdr, "u-exp")
+}
+
+func assertDesktopCommonHeaders(t *testing.T, hdr http.Header, uid string) {
+	t.Helper()
+	dom := hdr.Get("X-Domain")
+	if dom == "" || len(dom) >= 7 && (dom[:7] == "http://" || (len(dom) >= 8 && dom[:8] == "https://")) {
+		t.Errorf("X-Domain=%q want bare host without http(s)://", dom)
+	}
+	if hdr.Get("X-CodeBuddy-Request") != "1" {
+		t.Errorf("X-CodeBuddy-Request=%q want 1", hdr.Get("X-CodeBuddy-Request"))
+	}
+	if hdr.Get("X-Machine-ID") != deriveAccountStableID(uid, "machine") || len(hdr.Get("X-Machine-ID")) != 36 {
+		t.Errorf("X-Machine-ID=%q want 36-char stable machine ID", hdr.Get("X-Machine-ID"))
+	}
+	if hdr.Get("X-Session-ID") != deriveAccountStableID(uid, "session") || len(hdr.Get("X-Session-ID")) != 36 {
+		t.Errorf("X-Session-ID=%q want 36-char stable session ID", hdr.Get("X-Session-ID"))
+	}
+}
+
+// TestDeriveDesktopHW 验证 deriveDesktopHW 按 UID 幂等稳定、空 UID 回退默认且不同 UID 产生不同硬件画像。
+func TestDeriveDesktopHW(t *testing.T) {
+	def := deriveDesktopHW("")
+	if def != (desktopHWSpec{osVersion: "10.0.26220", cpuCores: 20, memorySize: 24}) {
+		t.Errorf("empty uid hw=%+v want default 10.0.26220/20/24", def)
+	}
+	if deriveDesktopHW("user-alpha") != deriveDesktopHW("user-alpha") {
+		t.Error("deriveDesktopHW should be deterministic for the same UID")
+	}
+	seen := map[desktopHWSpec]bool{}
+	for i := 0; i < 32; i++ {
+		seen[deriveDesktopHW("uid-"+string(rune('a'+i)))] = true
+	}
+	if len(seen) < 2 {
+		t.Errorf("deriveDesktopHW did not vary across UIDs: unique=%d", len(seen))
+	}
+}

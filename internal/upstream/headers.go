@@ -282,7 +282,7 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 		} else {
 			req.Header.Set("X-No-Enterprise-Id", "1")
 		}
-		if d := a.DomainValue(); d != "" {
+		if d := bareDomain(a.DomainValue()); d != "" {
 			req.Header.Set("X-Domain", d)
 		} else {
 			req.Header.Set("X-No-Department-Info", "1")
@@ -467,11 +467,21 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
 		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
 	}
-	if d := a.DomainValue(); d != "" {
+	if d := bareDomain(a.DomainValue()); d != "" {
 		req.Header.Set("X-Domain", d)
 	}
+	// 账号级稳定设备标识：billing 域与 chat/desktop 共享同一 X-Machine-ID / X-Session-ID。
+	c.injectAccountStableHeaders(req, a)
 	// 设备风控头：billing 域（report/travel/balance/checkin）同样注入。
 	c.injectDeviceToken(req, a)
+}
+
+// bareDomain 剥离 domain 字符串可能携带的协议头与末尾斜杠，确保 X-Domain 恒为纯主机名。
+func bareDomain(raw string) string {
+	d := strings.TrimSpace(raw)
+	d = strings.TrimPrefix(d, "https://")
+	d = strings.TrimPrefix(d, "http://")
+	return strings.TrimSuffix(d, "/")
 }
 
 // RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。

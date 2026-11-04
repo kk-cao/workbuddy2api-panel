@@ -197,7 +197,18 @@ func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID
 		AgentType:             "conversation",
 		UserID:                a.UID,
 	}
-	raw, err := json.Marshal([]chatRequestEvent{ev})
+	baseRaw, err := json.Marshal(ev)
+	if err != nil {
+		return err
+	}
+	merged := desktopFingerprint(a)
+	ver := c.clientVersionFor(a)
+	merged["ideVersion"] = ver
+	merged["extVersion"] = ver
+	if err := json.Unmarshal(baseRaw, &merged); err != nil {
+		return err
+	}
+	raw, err := json.Marshal([]map[string]any{merged})
 	if err != nil {
 		return err
 	}

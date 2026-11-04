@@ -58,3 +58,29 @@ func TestChatHeadersPreservesConversationID(t *testing.T) {
 func testAuth() *auth.Auth {
 	return &auth.Auth{UID: "u1", AccessToken: "at"}
 }
+
+// TestBillingHeadersBareDomainAndStableIDs 验证 BillingHeaders 剥离 a.Domain 的协议头并注入 36 hex 的 X-Machine-ID / X-Session-ID。
+func TestBillingHeadersBareDomainAndStableIDs(t *testing.T) {
+	c := &Client{}
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/v2/report", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &auth.Auth{UID: "u-billing", AccessToken: "at", Domain: "https://copilot.tencent.com/"}
+	c.BillingHeaders(req, a)
+
+	if got := req.Header.Get("X-Domain"); got != "copilot.tencent.com" {
+		t.Errorf("X-Domain = %q, want copilot.tencent.com", got)
+	}
+	hex36 := regexp.MustCompile(`^[0-9a-f]{36}$`)
+	for _, h := range []string{"X-Machine-ID", "X-Session-ID"} {
+		v := req.Header.Get(h)
+		if !hex36.MatchString(v) {
+			t.Errorf("%s = %q, want 36-char hex", h, v)
+		}
+	}
+	if req.Header.Get("X-Machine-ID") == req.Header.Get("X-Session-ID") {
+		t.Error("X-Machine-ID and X-Session-ID should differ")
+	}
+}
+

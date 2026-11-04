@@ -62,15 +62,50 @@ func deriveID(a *auth.Auth, salt string) string {
 // DesktopEvent 桌面端事件：业务字段任意（map），公共指纹由 ReportDesktopEvent 注入。
 type DesktopEvent map[string]any
 
+// desktopHWSpec 桌面端硬件画像（按账号 UID 确定性派生，避免多账号共用完全相同的 20核/24G/26220 静态特征，
+// 同时保证同一账号跨进程重启恒定）。
+type desktopHWSpec struct {
+	osVersion  string
+	cpuCores   int
+	memorySize int
+}
+
+var desktopHWProfiles = [...]desktopHWSpec{
+	{"10.0.26220", 20, 24},
+	{"10.0.26100", 16, 32},
+	{"10.0.22631", 12, 16},
+	{"10.0.22621", 8, 16},
+	{"10.0.19045", 16, 16},
+	{"10.0.26100", 24, 32},
+	{"10.0.22631", 16, 24},
+	{"10.0.19045", 12, 32},
+}
+
+// deriveDesktopHW 按 uid 稳定选择一个桌面硬件配置；uid 为空时回退首项默认配置。
+func deriveDesktopHW(uid string) desktopHWSpec {
+	if uid == "" {
+		return desktopHWProfiles[0]
+	}
+	sum := sha256.Sum256([]byte("wb2a:hw:" + uid))
+	idx := int(sum[0]) % len(desktopHWProfiles)
+	return desktopHWProfiles[idx]
+}
+
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
 func desktopFingerprint(a *auth.Auth) map[string]any {
 	now := time.Now().UnixMilli()
+	var uid, nickname string
+	if a != nil {
+		uid = a.UID
+		nickname = a.Nickname
+	}
+	hw := deriveDesktopHW(uid)
 	return map[string]any{
 		"timezone":     "Asia/Shanghai",
 		"reportDelay":  2000,
-		"userId":       a.UID,
-		"username":     a.Nickname,
-		"userNickname": a.Nickname,
+		"userId":       uid,
+		"username":     nickname,
+		"userNickname": nickname,
 		"product":      "SaaS",
 		"releaseDate":  int64(1793093050922),
 		"commit":       "d46924219e79332f49c37ccebf27292f87001b19",
@@ -83,9 +118,9 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 		"extVersion":   "5.9.3",
 		"os":           "win32",
 		"arch":         "x64",
-		"osVersion":    "10.0.26220",
-		"cpuCores":     20,
-		"memorySize":   24,
+		"osVersion":    hw.osVersion,
+		"cpuCores":     hw.cpuCores,
+		"memorySize":   hw.memorySize,
 		"timestamp":    now,
 		"presentAt":    now,
 	}
@@ -232,11 +267,16 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUA)
+	req.Header.Set("User-Agent", c.userAgent(a))
+	req.Header.Set("X-Domain", bareDomain(c.desktopBase(a)))
 	req.Header.Set("X-Product", "SaaS")
+	req.Header.Set("Accept-Language", acceptLanguageFor(a))
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
+	c.injectAccountStableHeaders(req, a)
+	c.injectDeviceToken(req, a)
+	c.injectCodeBuddyRequest(req)
 	_, err = c.doJSON(req)
 	return err
 }
@@ -409,12 +449,16 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	}
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", desktopUA)
-	req.Header.Set("X-Domain", c.chatBase(a))
+	req.Header.Set("User-Agent", c.userAgent(a))
+	req.Header.Set("X-Domain", bareDomain(c.chatBase(a)))
 	req.Header.Set("X-Product", "SaaS")
+	req.Header.Set("Accept-Language", acceptLanguageFor(a))
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
+	c.injectAccountStableHeaders(req, a)
+	c.injectDeviceToken(req, a)
+	c.injectCodeBuddyRequest(req)
 	var out struct {
 		Experts []MarketExpert `json:"experts"`
 	}
@@ -458,17 +502,22 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "text/event-stream")
 	h.Set("User-Agent", c.userAgent(a))
-	h.Set("X-Domain", strings.TrimPrefix(strings.TrimPrefix(c.chatBase(a), "https://"), "http://"))
+	h.Set("X-Domain", bareDomain(c.chatBase(a)))
 	h.Set("X-Product", "SaaS")
+	h.Set("X-Private-Data", "true")
 	h.Set("X-User-Id", a.UID)
 	h.Set("X-Conversation-ID", conversationID)
 	h.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
 	h.Set("X-Agent-Intent", "craft")
 	h.Set("X-Agent-Type", "main")
+	h.Set("X-Agent-Purpose", "conversation")
 	h.Set("X-IDE-Name", "WorkBuddy")
 	h.Set("X-IDE-Type", "WorkBuddy")
 	h.Set("X-IDE-Version", c.clientVersionFor(a))
-	h.Set("x-codebuddy-request", "1")
+	h.Set("Accept-Language", acceptLanguageFor(a))
+	c.injectAccountStableHeaders(req, a)
+	c.injectDeviceToken(req, a)
+	c.injectCodeBuddyRequest(req)
 	if expertID != "" {
 		h.Set("X-Expert-Id", expertID)
 	}

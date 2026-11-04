@@ -10,9 +10,10 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
-// TestReportChatActivitySendsArrayWithUserID 断言出站 body 是数组、含 userId、eventCode 正确。
+// TestReportChatActivitySendsArrayWithUserID 断言出站 body 是数组、含 userId、eventCode 正确，并包含桌面指纹与设备头。
 func TestReportChatActivitySendsArrayWithUserID(t *testing.T) {
 	var got []map[string]any
+	var gotHdr http.Header
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v2/report" {
 			t.Errorf("path=%s want /v2/report", r.URL.Path)
@@ -20,6 +21,7 @@ func TestReportChatActivitySendsArrayWithUserID(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Errorf("method=%s want POST", r.Method)
 		}
+		gotHdr = r.Header.Clone()
 		raw, _ := io.ReadAll(r.Body)
 		var arr []map[string]any
 		if err := json.Unmarshal(raw, &arr); err != nil {
@@ -49,6 +51,26 @@ func TestReportChatActivitySendsArrayWithUserID(t *testing.T) {
 	}
 	if ev["mode"] != "craft" {
 		t.Errorf("mode=%v want craft", ev["mode"])
+	}
+	wantMachine := deriveAccountStableID("u-active", "machine")
+	wantSession := deriveAccountStableID("u-active", "session")
+	if ev["machineId"] != wantMachine {
+		t.Errorf("machineId=%v want %s", ev["machineId"], wantMachine)
+	}
+	if ev["sessionId"] != wantSession {
+		t.Errorf("sessionId=%v want %s", ev["sessionId"], wantSession)
+	}
+	if ev["ideVersion"] != defaultClientVersion {
+		t.Errorf("ideVersion=%v want %s", ev["ideVersion"], defaultClientVersion)
+	}
+	if ev["commit"] == "" || ev["commit"] == nil {
+		t.Errorf("commit=%v want non-empty", ev["commit"])
+	}
+	if gotHdr.Get("X-Machine-ID") != wantMachine {
+		t.Errorf("X-Machine-ID=%q want %s", gotHdr.Get("X-Machine-ID"), wantMachine)
+	}
+	if gotHdr.Get("X-Session-ID") != wantSession {
+		t.Errorf("X-Session-ID=%q want %s", gotHdr.Get("X-Session-ID"), wantSession)
 	}
 	// 出站 body 必须是数组（以 [ 开头），不是单个对象。
 }
