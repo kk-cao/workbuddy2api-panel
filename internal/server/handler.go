@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"sync"
@@ -122,7 +123,24 @@ type Handler struct {
 	degrade degradeGate
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
-	wafIP wafIPGate
+	wafIP    wafIPGate
+	restrict restrictionGate
+}
+
+func (h *Handler) noteAccountRestriction(realm, uid string) bool {
+	_, healthy, _, _, _ := h.cfg.Pool.CountsDetailedForRealm(realm)
+	return h.restrict.note(realm, uid, defaultRestrictionHold, healthy)
+}
+
+func writeRestrictionHoldError(w http.ResponseWriter, rem time.Duration) {
+	sec := int(rem.Seconds() + 0.999)
+	if sec < 1 {
+		sec = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(sec))
+	writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "upstream_restriction_hold",
+		"upstream restriction wave detected; dispatch paused temporarily",
+		"multiple accounts in this realm were restricted (11140); retry after the cooldown")
 }
 
 // NewHandler 构建 handler。
@@ -782,10 +800,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// every client on that account ends up sharing a single, constantly evicted
 	// prefix-cache slot.
 	convID := session.ResolveConversationID(body)
-	if convID == "" {
-		convID = sessKey
+	chatMeta := upstream.ChatMeta{
+		ConversationID: convID,
+		CacheKeyID:     sessKey,
 	}
-	chatMeta := upstream.ChatMeta{ConversationID: convID}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
 	} else if turnKey != "" && sessKey != "" {
@@ -803,15 +821,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
+	skipRealm := ""
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
+			stickyPaused := false
+			if acct != nil {
+				_, stickyPaused = h.restrict.paused(acct.Realm())
+			}
 			// 跨域回退开启且请求为裸名时，粘性号可以落在任一域（回退成功后绑定的是另一域
-			// 的账号，下一轮不该被 realm 校验立刻解绑）。
-			if acct == nil || (realm != "" && acct.Realm() != realm && !crossRealm) {
-				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
+			// 的账号，下一轮不该被 realm 校验立刻解绑）；若所在域已被跳过或暂停则解绑重选。
+			if acct == nil || (skipRealm != "" && acct.Realm() == skipRealm) || stickyPaused || (realm != "" && acct.Realm() != realm && !crossRealm) {
+				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符/暂停 → 解绑，
 				// 本次回落普通轮换。
 				unbindSticky()
 				acct = nil
@@ -821,18 +844,45 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
 			pickRealm := realm
-			if crossRealm && h.cfg.Pool.ServableForModelRealm(bareModel, realm) == 0 &&
-				h.cfg.Pool.ServableForModelRealm(bareModel, otherRealm(realm)) > 0 {
-				// 首选域此刻没有真正可服务的号（11102 模型级负缓存 / 账号级冷却 /
-				// 在途占满），而另一域有 → 直接换域选号（issue #135）。先看健康度再选，
-				// 避免拿全冷却兜底捞回来的旧域账号白撞一次上游。
-				pickRealm = otherRealm(realm)
+			if crossRealm {
+				if skipRealm != "" {
+					pickRealm = otherRealm(skipRealm)
+				} else if h.cfg.Pool.ServableForModelRealm(bareModel, realm) == 0 &&
+					h.cfg.Pool.ServableForModelRealm(bareModel, otherRealm(realm)) > 0 {
+					// 首选域此刻没有真正可服务的号（11102 模型级负缓存 / 账号级冷却 /
+					// 在途占满），而另一域有 → 直接换域选号（issue #135）。先看健康度再选，
+					// 避免拿全冷却兜底捞回来的旧域账号白撞一次上游。
+					pickRealm = otherRealm(realm)
+				}
+				if _, paused := h.restrict.paused(pickRealm); paused {
+					alt := otherRealm(pickRealm)
+					if _, altPaused := h.restrict.paused(alt); !altPaused && h.cfg.Pool.ServableForModelRealm(bareModel, alt) > 0 {
+						pickRealm = alt
+					}
+				}
+			}
+			if rem, paused := h.restrict.paused(pickRealm); paused {
+				writeRestrictionHoldError(w, rem)
+				st.status = http.StatusServiceUnavailable
+				st.outcome = reqlog.OutcomeHTTPError
+				return
 			}
 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, pickRealm)
-			if acct == nil && crossRealm {
+			if acct == nil && crossRealm && skipRealm == "" {
 				// 该域选不到（并发抢名额/轮换耗尽/另一域刚冷却完）→ 另一域再试一次，
 				// 保持尽力而为语义；tried 已记录失败号，轮转仍由 MaxRotate 封顶。
-				acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, otherRealm(pickRealm))
+				alt := otherRealm(pickRealm)
+				if _, paused := h.restrict.paused(alt); !paused {
+					acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, alt)
+				}
+			}
+		}
+		if acct != nil {
+			if rem, paused := h.restrict.paused(acct.Realm()); paused {
+				writeRestrictionHoldError(w, rem)
+				st.status = http.StatusServiceUnavailable
+				st.outcome = reqlog.OutcomeHTTPError
+				return
 			}
 		}
 		if acct == nil {
@@ -1044,6 +1094,56 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
+			// 11128 / 11151 / 11148 / 11133：请求级/通道指纹级确定性错误，不罚号、不轮转，直接回 400。
+			if kind == upstream.ErrChannelRefused || kind == upstream.ErrEmptyContent ||
+				kind == upstream.ErrToolMismatch || kind == upstream.ErrModelParamInvalid {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = kind.String() + ": request was rejected by upstream"
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, kind.String(), msg,
+					h.hintOf(kind, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
+			// 11102「该后端无此模型」：同域不再无谓撞第二个号；若允许裸名跨域回退且另一域可服务，立刻切换另一域，否则快速 400。
+			if kind == upstream.ErrModelBlocked && upstream.IsBackendModelMissing(string(respBody)) {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				if crossRealm && skipRealm == "" && acct.Realm() == realm &&
+					h.cfg.Pool.ServableForModelRealm(bareModel, otherRealm(realm)) > 0 {
+					lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+					skipRealm = acct.Realm()
+					continue
+				}
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "model is unavailable at upstream"
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "model_unavailable", msg,
+					h.hintOf(upstream.ErrModelBlocked, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
+			// 11140 账号风控限制：命中即禁用该号、记入连坐波次门控、立即停手终止轮转（绝不撞下一个号）。
+			if kind == upstream.ErrAccountFault && upstream.IsAccountRestriction(string(respBody)) {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				h.noteAccountRestriction(acct.Realm(), acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "account restricted by upstream (11140)"
+				}
+				writeOpenAIErrorHint(w, http.StatusForbidden, "account_restricted", msg,
+					h.hintOf(kind, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusForbidden
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
@@ -1095,12 +1195,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeStreamError
 				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			case errFrame != "":
-				// 上游以 error 帧报错（6004 限流 / 内容拦截 / 审核）：按帧内容分类并
-				// 处置账号——**不记成功、不清 11102 负缓存、不绑粘性**。此前这些动作
-				// 在流开始前就做了，于是一个正在限流的号被当成健康号，粘性还会把
-				// 整个会话钉在它身上，后续每轮都失败。
+				// 上游以 error 帧报错（6004 限流 / 11140 账号限制 / 内容拦截 / 审核）：按帧内容分类并
+				// 处置账号——**不记成功、不清 11102 负缓存、不绑粘性**。
 				kind := upstream.FrameKind(errFrame)
 				h.applyErrorPolicy(acct.UID, kind, errFrame, bareModel, nil)
+				if upstream.IsAccountRestriction(errFrame) {
+					h.noteAccountRestriction(acct.Realm(), acct.UID)
+				}
 				st.status = http.StatusServiceUnavailable
 				st.outcome = reqlog.OutcomeStreamError
 				log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
@@ -1497,17 +1598,13 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
 		// 注意 11128 的 msg 同为 "request illegal"，但那是通道校验失败，已在
 		// Classify 分流到 ErrChannelRefused，走不到这里。
-		if upstream.IsAccountRestricted(body) {
-			h.cfg.Pool.Disable(uid, "account restricted by upstream (11140 request illegal); appeal in WorkBuddy (submit feedback) to lift the restriction")
+		if upstream.IsAccountRestriction(body) {
+			h.cfg.Pool.Disable(uid, "account restricted by upstream (11140); appeal in WorkBuddy (submit feedback) to lift the restriction")
 			return
 		}
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (14017)")
 	case upstream.ErrChannelRefused:
-		// 11128 通道校验失败（上游判定请求可能不是官方客户端发出，displayMsg 就是
-		// 「请求被拦截，请重新发送」）。账号本身健康——官方客户端可正常使用同一账号，
-		// 这不是账号级故障，**不罚账号**（无冷却/熔断/NoteFailures）。与
-		// ErrContentBlocked 同待遇，由轮转继续尝试（换号不改变通道指纹，若全池同错
-		// 会把上游原文透传给客户端，提示排查客户端指纹）。
+		// 11128 通道校验失败：账号本身健康，不罚账号，请求级快速失败。
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
@@ -1521,12 +1618,8 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 	case upstream.ErrImageInvalid:
 		// 图片格式/数据无效：请求的问题不是账号的问题（同一 body 换任何号都会
 		// 得到相同解析错误）。零动作，chatCompletions 已 fail-fast 透传。
-	case upstream.ErrBadParams:
-		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
-		// 有问题（网关侧不再截断，均为客户端畸形 JSON）。换了账号照样 400，
-		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；chatCompletions
-		// 已 fail-fast 400 透传原文、终止轮转——「换号可能有不同模型权限」属 11102
-		// （ErrModelBlocked）的分类域，与本类无关。
+	case upstream.ErrBadParams, upstream.ErrEmptyContent, upstream.ErrToolMismatch, upstream.ErrModelParamInvalid:
+		// 11101 / 11129 / 11152 / 11151 / 11148 / 11133：请求级参数/格式错误，不罚账号，已在循环内 fail-fast 透传。
 	case upstream.ErrUpstreamBusy:
 		// 6021「queue.full.title」渠道级容量满载：账号余额健康、未限流、session 未死，
 		// 换号也撞同一堵墙。零动作（不冷却/不熔断/不 NoteError/不喂连败，同

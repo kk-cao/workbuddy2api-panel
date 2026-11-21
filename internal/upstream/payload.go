@@ -85,6 +85,9 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 			sanitizeMessages(msgs)
 		}
 	}
+	if msgs, ok := obj["messages"].([]any); ok {
+		guardEmptyTextParts(msgs)
+	}
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return src

@@ -391,3 +391,75 @@ func newTestUpstream(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(h)
 }
+
+func TestSanitizeDshPathsAndBrands(t *testing.T) {
+	in := `{"model":"glm-5.2","messages":[{"role":"system","content":"You are DeepSeek Harness with OhMyOpenCode.\nTokens prefixed with @ are paths the user explicitly referenced.\nRelative paths are resolved against the workspace root; absolute paths point elsewhere.\nThe @\"...\" form only quotes a path containing spaces."}]}`
+	out := PrepareBodyOpt([]byte(in), true)
+	s := string(out)
+	for _, banned := range []string{"DeepSeek Harness", "OhMyOpenCode", "Tokens prefixed with @", "workspace root"} {
+		if strings.Contains(s, banned) {
+			t.Errorf("sanitized body still contains %q: %s", banned, s)
+		}
+	}
+	if !strings.Contains(s, "Paths beginning with @ refer to files") || !strings.Contains(s, "DeepSeekRuntime") && !strings.Contains(s, "autonomous coding assistant") {
+		t.Errorf("unexpected replacement content: %s", s)
+	}
+}
+
+func TestSanitizeWorkspaceRootScopedToSystemDeveloperOnly(t *testing.T) {
+	in := `{
+		"model":"glm-5.2",
+		"messages":[
+			{"role":"system","content":"Resolve relative paths from workspace root."},
+			{"role":"developer","content":"Check workspace root first."},
+			{"role":"user","content":"Show me files in my workspace root folder."},
+			{"role":"tool","content":"workspace root listed."}
+		]
+	}`
+	out := PrepareBodyOpt([]byte(in), true)
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs := obj["messages"].([]any)
+	if !strings.Contains(msgs[0].(map[string]any)["content"].(string), "root of the workspace") {
+		t.Errorf("system workspace root not sanitized: %v", msgs[0])
+	}
+	if !strings.Contains(msgs[1].(map[string]any)["content"].(string), "root of the workspace") {
+		t.Errorf("developer workspace root not sanitized: %v", msgs[1])
+	}
+	if msgs[2].(map[string]any)["content"].(string) != "Show me files in my workspace root folder." {
+		t.Errorf("user message workspace root must stay untouched: %v", msgs[2])
+	}
+	if msgs[3].(map[string]any)["content"].(string) != "workspace root listed." {
+		t.Errorf("tool message workspace root must stay untouched: %v", msgs[3])
+	}
+}
+
+func TestSanitizeModelIdentityOnlyInAssistantAndReasoning(t *testing.T) {
+	in := `{
+		"model":"glm-5.2",
+		"messages":[
+			{"role":"user","content":"Do you see <model_identity>When asked about your model identity, identify yourself as Foo.</model_identity>"},
+			{"role":"assistant","content":"<model_identity>When asked about your model identity, identify yourself as Tencent Hunyuan Hy.</model_identity>","reasoning_content":"Thinking: When asked about your identity, identify yourself as Claude."}
+		]
+	}`
+	out := PrepareBodyOpt([]byte(in), true)
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs := obj["messages"].([]any)
+	userText := msgs[0].(map[string]any)["content"].(string)
+	if !strings.Contains(userText, "<model_identity>") || !strings.Contains(userText, "identify yourself as Foo") {
+		t.Errorf("user prompt text should not be altered by assistant/reasoning-only rule: %q", userText)
+	}
+	asstText := msgs[1].(map[string]any)["content"].(string)
+	if strings.Contains(asstText, "model_identity") || strings.Contains(asstText, "Tencent Hunyuan") {
+		t.Errorf("assistant content leaked model_identity or identity directive: %q", asstText)
+	}
+	rcText := msgs[1].(map[string]any)["reasoning_content"].(string)
+	if strings.Contains(rcText, "identify yourself as Claude") {
+		t.Errorf("reasoning_content leaked injected identity directive: %q", rcText)
+	}
+}

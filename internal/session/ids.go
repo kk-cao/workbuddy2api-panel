@@ -10,11 +10,13 @@ package session
 import (
 	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"strings"
+	"time"
 )
 
 // ResolveConversationID 从请求体提取会话头族的 conversationId（snake/camel 双形态，
@@ -44,16 +46,55 @@ func ResolveConversationID(body []byte) string {
 	return strOrEmpty(obj["conversationId"])
 }
 
-// NewMessageID 生成消息级 ID：32 位 hex（UUID v4 去横线的长度形态），对齐官方
-// X-Request-ID / X-Conversation-Message-ID。crypto/rand 失败（理论上不可能）时回落
-// math/rand/v2 双 uint64 拼 32 hex——恒 32 hex、恒合法，可安全用作 B3 TraceId。
+// NewMessageID 生成消息级 ID：32 位小写 hex，前 12 位为当前毫秒时间戳 hex、
+// 后 20 位为加密随机 hex（时间有序形态，兼容 B3 32 hex，同时对齐官方消息 ID 特征）。
 func NewMessageID() string {
+	ms := uint64(time.Now().UnixMilli()) & 0xffffffffffff
+	b := make([]byte, 10)
+	if _, err := cryptorand.Read(b); err == nil {
+		return fmt.Sprintf("%012x%s", ms, hex.EncodeToString(b))
+	}
+	// 熵源故障的极端兜底：仍保证 12 hex 时间戳 + 20 hex 随机（32 hex）。
+	r1, r2 := uint64(rand.Uint64()), uint32(rand.Uint32())
+	return fmt.Sprintf("%012x%016x%04x", ms, r1, r2&0xffff)
+}
+
+// NewTimeOrderedID 生成 RFC 9562 标准 36 字符 UUIDv7（xxxxxxxx-xxxx-7xxx-yxxx-xxxxxxxxxxxx），
+// 前 48 位为当前毫秒时间戳，供需要时间有序 UUID 的会话级头（如 X-Conversation-ID）使用。
+func NewTimeOrderedID() string {
+	var b [16]byte
+	ms := uint64(time.Now().UnixMilli())
+	b[0] = byte(ms >> 40)
+	b[1] = byte(ms >> 32)
+	b[2] = byte(ms >> 24)
+	b[3] = byte(ms >> 16)
+	b[4] = byte(ms >> 8)
+	b[5] = byte(ms)
+	if _, err := cryptorand.Read(b[6:]); err != nil {
+		binary.BigEndian.PutUint64(b[6:14], rand.Uint64())
+		binary.BigEndian.PutUint16(b[14:16], uint16(rand.Uint32()))
+	}
+	b[6] = (b[6] & 0x0f) | 0x70
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// NewTraceID 生成纯随机 32 位小写 hex（16 字节，无时间前缀），供 X-Trace-ID / X-Request-ID 等使用。
+func NewTraceID() string {
 	b := make([]byte, 16)
 	if _, err := cryptorand.Read(b); err == nil {
 		return hex.EncodeToString(b)
 	}
-	// 熵源故障的极端兜底：仍保证 32 hex（fallbackID 不 panic、不空串）。
 	return fmt.Sprintf("%016x%016x", uint64(rand.Uint64())|1, rand.Uint64())
+}
+
+// NewSpanID 生成纯随机 16 位小写 hex（8 字节），供 X-B3-SpanId / X-B3-ParentSpanId 使用。
+func NewSpanID() string {
+	b := make([]byte, 8)
+	if _, err := cryptorand.Read(b); err == nil {
+		return hex.EncodeToString(b)
+	}
+	return fmt.Sprintf("%016x", uint64(rand.Uint64())|1)
 }
 
 // deriveSalt 进程启动随机盐：对所有稳定聚合 ID 的纯派生统一加盐，使派生值无法

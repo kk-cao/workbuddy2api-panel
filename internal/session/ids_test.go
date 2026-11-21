@@ -3,8 +3,11 @@ package session
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // imagePartSig 计算 part 原文摘要（sha256 前 8 hex），供期望值精确构造——
@@ -143,5 +146,68 @@ func TestTurnRequestIDDerivation(t *testing.T) {
 		if len(id) != 32 {
 			t.Errorf("TurnRequestID value %q len=%d want 32", id, len(id))
 		}
+	}
+}
+
+func TestNewMessageIDTimePrefixAndUniqueness(t *testing.T) {
+	before := time.Now().UnixMilli()
+	id1 := NewMessageID()
+	id2 := NewMessageID()
+	after := time.Now().UnixMilli()
+
+	if id1 == id2 {
+		t.Fatalf("consecutive NewMessageID() should differ: %q", id1)
+	}
+	ts, err := strconv.ParseInt(id1[:12], 16, 64)
+	if err != nil {
+		t.Fatalf("parse timestamp prefix %q: %v", id1[:12], err)
+	}
+	if ts < before-5000 || ts > after+5000 {
+		t.Errorf("timestamp prefix %d out of range [%d, %d]", ts, before, after)
+	}
+}
+
+func TestNewTimeOrderedIDFormatAndTimestamp(t *testing.T) {
+	re := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	before := time.Now().UnixMilli()
+	id1 := NewTimeOrderedID()
+	id2 := NewTimeOrderedID()
+	after := time.Now().UnixMilli()
+
+	if !re.MatchString(id1) {
+		t.Fatalf("NewTimeOrderedID()=%q does not match UUIDv7", id1)
+	}
+	if id1 == id2 {
+		t.Fatalf("consecutive NewTimeOrderedID() collided: %q", id1)
+	}
+	hexTs := id1[:8] + id1[9:13]
+	ts, err := strconv.ParseInt(hexTs, 16, 64)
+	if err != nil {
+		t.Fatalf("parse UUIDv7 ms prefix %q: %v", hexTs, err)
+	}
+	if ts < before-5000 || ts > after+5000 {
+		t.Errorf("UUIDv7 ts=%d out of window [%d, %d]", ts, before, after)
+	}
+}
+
+func TestNewTraceAndSpanID(t *testing.T) {
+	isLowerHex := func(s string, wantLen int) bool {
+		if len(s) != wantLen {
+			return false
+		}
+		for _, ch := range s {
+			if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
+				return false
+			}
+		}
+		return true
+	}
+	t1, t2 := NewTraceID(), NewTraceID()
+	if !isLowerHex(t1, 32) || !isLowerHex(t2, 32) || t1 == t2 {
+		t.Errorf("unexpected NewTraceID values: %q, %q", t1, t2)
+	}
+	s1, s2 := NewSpanID(), NewSpanID()
+	if !isLowerHex(s1, 16) || !isLowerHex(s2, 16) || s1 == s2 {
+		t.Errorf("unexpected NewSpanID values: %q, %q", s1, s2)
 	}
 }

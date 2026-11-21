@@ -40,22 +40,29 @@ import (
 const (
 	desktopReportPath    = "/v2/report"
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
-	// desktopUA 实测桌面客户端 UA（5.9.3 内嵌 CLI 2.165.0）。
-	desktopUA = "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"
+	// desktopUA 实测桌面客户端 UA（CN 5.11.3 内嵌 CLI 2.176.0）。
+	desktopUA = "WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0"
+
+	desktopCommitCN        = "ecace0f7028166695994300182295329b8b95449"
+	desktopReleaseDateCN   = int64(1794502169764)
+	desktopCommitGlobal    = "0026dff06ce8414140e6f2fa731049855c3ecc6f"
+	desktopReleaseDateIntl = int64(1794817062903)
 )
 
-// desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（copilot.tencent.com）。
+// desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase。
 func (c *Client) desktopBase(a *auth.Auth) string { return c.chatBase(a) }
 
-// deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/qimei36 复用），
+// deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/qimei36/sessionId body 复用），
 // 幂等：同一账号每次生成相同值，模拟固定设备。
-// 当 salt == "machine" || salt == "session" 时复用 deriveAccountStableID(a.UID, salt)，
-// 确保桌面事件载荷中的 machineId/sessionId 与出站请求头 X-Machine-ID / X-Session-ID 完全一致。
 func deriveID(a *auth.Auth, salt string) string {
-	if salt == "machine" || salt == "session" {
-		return deriveAccountStableID(a.UID, salt)
+	uid := ""
+	if a != nil {
+		uid = a.UID
 	}
-	sum := sha256.Sum256([]byte(salt + ":" + a.UID))
+	if salt == "machine" || salt == "session" {
+		return deriveAccountStableID(uid, salt)
+	}
+	sum := sha256.Sum256([]byte(salt + ":" + uid))
 	return hex.EncodeToString(sum[:18]) // 36 hex chars
 }
 
@@ -99,6 +106,14 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 		uid = a.UID
 		nickname = a.Nickname
 	}
+	releaseDate := desktopReleaseDateCN
+	commit := desktopCommitCN
+	ver := defaultClientVersion
+	if a != nil && a.IsGlobal() {
+		releaseDate = desktopReleaseDateIntl
+		commit = desktopCommitGlobal
+		ver = defaultClientVersionGlobal
+	}
 	hw := deriveDesktopHW(uid)
 	return map[string]any{
 		"timezone":     "Asia/Shanghai",
@@ -107,15 +122,15 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 		"username":     nickname,
 		"userNickname": nickname,
 		"product":      "SaaS",
-		"releaseDate":  int64(1793093050922),
-		"commit":       "d46924219e79332f49c37ccebf27292f87001b19",
+		"releaseDate":  releaseDate,
+		"commit":       commit,
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
-		"ideVersion":   "5.9.3",
+		"ideVersion":   ver,
 		"machineId":    deriveID(a, "machine"),
 		"sessionId":    deriveID(a, "session"),
 		"extName":      "workbuddy-desktop",
-		"extVersion":   "5.9.3",
+		"extVersion":   ver,
 		"os":           "win32",
 		"arch":         "x64",
 		"osVersion":    hw.osVersion,
@@ -126,9 +141,7 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 	}
 }
 
-// ReportDesktopEvent 以桌面客户端指纹向 copilot.tencent.com/v2/report 批量上报事件。
-// events 为业务载荷（eventCode 等字段由调用方给出）；公共指纹自动注入，
-// 业务字段优先（可用于覆盖 qimei36/machineId 等设备标识做真实设备对齐）。
+// ReportDesktopEvent 以桌面客户端指纹向 /v2/report 批量上报事件。
 func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error {
 	if len(events) == 0 {
 		return fmt.Errorf("desktop report: no events")
@@ -161,7 +174,9 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", c.userAgent(a))
+	req.Header.Set("User-Agent", c.rpcUAFor(a))
+	c.injectClientIdentityHeaders(req, a)
+	c.injectCodeBuddyRequest(req)
 	domain := strings.TrimPrefix(strings.TrimPrefix(c.desktopBase(a), "https://"), "http://")
 	req.Header.Set("X-Domain", domain)
 	req.Header.Set("X-Product", "SaaS")
@@ -169,9 +184,6 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	c.injectCodeBuddyRequest(req)
-	req.Header.Set("Accept-Language", acceptLanguageFor(a))
-	c.injectAccountStableHeaders(req, a)
 	c.injectDeviceToken(req, a)
 	_, err = c.doJSON(req)
 	return err
@@ -267,14 +279,13 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", c.userAgent(a))
+	req.Header.Set("User-Agent", c.rpcUAFor(a))
+	c.injectClientIdentityHeaders(req, a)
 	req.Header.Set("X-Domain", bareDomain(c.desktopBase(a)))
 	req.Header.Set("X-Product", "SaaS")
-	req.Header.Set("Accept-Language", acceptLanguageFor(a))
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	c.injectAccountStableHeaders(req, a)
 	c.injectDeviceToken(req, a)
 	c.injectCodeBuddyRequest(req)
 	_, err = c.doJSON(req)
@@ -299,7 +310,7 @@ func DesktopBuddyAppSequence(buddyID, buddyName string) []DesktopEvent {
 	return []DesktopEvent{
 		mk("buddyapp_discover_click", nil),
 		mk("buddyapp_show", map[string]any{"elementId": buddyID, "elementName": buddyName, "position": 2}),
-		mk("buddyapp_enter_click", map[string]any{"elementId": buddyID, "elementName": buddyName, "position": 2, "isFirstPage": "1"}),
+		mk("buddyapp_enter_click", map[string]any{"elementId": buddyID, "elementName": buddyName, "position": 2, "isFirstPage": true}),
 		mk("buddyapp_auth_confirm_click", map[string]any{"elementId": buddyID, "elementName": buddyName}),
 		mk("buddyapp_bindaccount_skip_click", map[string]any{"elementId": buddyID, "elementName": buddyName}),
 	}
@@ -449,14 +460,13 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	}
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", c.userAgent(a))
+	req.Header.Set("User-Agent", c.rpcUAFor(a))
+	c.injectClientIdentityHeaders(req, a)
 	req.Header.Set("X-Domain", bareDomain(c.chatBase(a)))
 	req.Header.Set("X-Product", "SaaS")
-	req.Header.Set("Accept-Language", acceptLanguageFor(a))
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	c.injectAccountStableHeaders(req, a)
 	c.injectDeviceToken(req, a)
 	c.injectCodeBuddyRequest(req)
 	var out struct {
@@ -502,9 +512,10 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "text/event-stream")
 	h.Set("User-Agent", c.userAgent(a))
+	c.injectClientIdentityHeaders(req, a)
 	h.Set("X-Domain", bareDomain(c.chatBase(a)))
 	h.Set("X-Product", "SaaS")
-	h.Set("X-Private-Data", "true")
+	h.Set("X-Private-Data", privateDataHeaderValue(a))
 	h.Set("X-User-Id", a.UID)
 	h.Set("X-Conversation-ID", conversationID)
 	h.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
@@ -514,8 +525,6 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	h.Set("X-IDE-Name", "WorkBuddy")
 	h.Set("X-IDE-Type", "WorkBuddy")
 	h.Set("X-IDE-Version", c.clientVersionFor(a))
-	h.Set("Accept-Language", acceptLanguageFor(a))
-	c.injectAccountStableHeaders(req, a)
 	c.injectDeviceToken(req, a)
 	c.injectCodeBuddyRequest(req)
 	if expertID != "" {

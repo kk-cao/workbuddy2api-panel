@@ -71,10 +71,9 @@ type SearchOutcome struct {
 
 // SearchHeaders 搜索请求头。
 //
-// 复用 ChatHeaders 的桌面端全套头族（UA 三段式 / Origin / Referer /
-// X-CodeBuddy-Request / X-Machine-ID / X-Session-ID / Accept-Language /
-// Authorization / X-User-Id / 企业与域头 / X-Agent-Purpose + X-IDE-* + X-Product /
-// X-Device-Token / 会话头族 X-Conversation-* + X-Request-ID + X-Root-Request-ID + B3），
+// 复用 ChatHeaders 的桌面端全套头族（WorkBuddy UA 三段式 / X-CodeBuddy-Request /
+// X-Client-* / Authorization / X-User-Id / 企业与域头 / X-Agent-Purpose + X-IDE-* +
+// X-Product / X-Device-Token / 会话与 B3/W3C 链路头族），
 // 再按官方 WebSearchTool 的差异覆盖四处：
 //   - Accept：搜索是非流式 JSON，官方为 application/json
 //     （ChatHeaders 为 chat 流式设成 event-stream，必须覆盖）

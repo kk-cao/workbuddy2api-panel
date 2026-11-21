@@ -20,6 +20,9 @@ var sanitizeFeatures = []string{
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
 	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
 	"11128",                                           // 上游反探测：裸数字错误码
+	"Tokens prefixed with @",                          // DSH @ 路径说明段
+	"DeepSeek Harness",                                // DeepSeek Harness 品牌/身份句
+	"OhMyOpenCode",                                    // OhMyOpenCode 标识
 }
 
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
@@ -38,7 +41,27 @@ var sanitizeBareHdrRe = regexp.MustCompile(`(?i)x-anthropic-billing-header`)
 // sanitizeKvRe 剥离层：尾随裸键值（cc_xxx=...;）循环清理。
 var sanitizeKvRe = regexp.MustCompile(`(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*`)
 
-// sanitizeRewrites 改写层：全模板句逐字替换（每句只改一个词，语义不变）。
+// sanitizeDshPathsRe DSH @ 开头的路径解析整段说明，不含品牌词，须整段同义改写。
+var sanitizeDshPathsRe = regexp.MustCompile(
+	`(?is)Tokens prefixed with @ are paths the user explicitly referenced\..*?path (?:containing|that contains) spaces\.`)
+
+const sanitizeDshPathsReplacement = "Paths beginning with @ refer to files the user explicitly mentioned. " +
+	"Relative paths are resolved against the project root; absolute paths point " +
+	"to files or directories on the host. A trailing slash marks a directory, so " +
+	"list it when its contents matter. Anything else is a file: open it with the " +
+	"read tool when its contents are needed, and never claim to have inspected it " +
+	"before reading. The @\"...\" form only quotes a path that contains spaces."
+
+// sanitizeInjectedIdentityRe 上游服务端注入的身份祈使句，模型思维链复述回流会滚雪球。
+var sanitizeInjectedIdentityRe = regexp.MustCompile(
+	`(?i)when asked about your[^.\n]{0,60}?identity[^.\n]{0,60}?,\s*identify yourself as\s+[^\n]{1,80}?\.(\W|$)`)
+
+const sanitizeInjectedIdentityReplacement = "When asked about your capabilities, answer using only the information available in this conversation.$1"
+
+// sanitizeModelIdentityTagRe 剥离 <model_identity>...</model_identity> 标签外壳，保留内部文本。
+var sanitizeModelIdentityTagRe = regexp.MustCompile(`(?i)</?model_identity>`)
+
+// sanitizeRewrites 改写层：全模板句逐字替换（每句只改一词，语义不变）。
 //
 // 身份句的匹配串**不带结尾标点**（只到 "…for Claude" 为止）：
 // CLI 版这句以句号收尾（"…for Claude."），桌面版（claude-desktop-3p / Agent SDK）
@@ -61,6 +84,18 @@ var sanitizeRewrites = [][2]string{
 		"You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant.",
 	},
 	{
+		"You are DeepSeek Harness",
+		"You are an autonomous coding assistant",
+	},
+	{
+		"DeepSeek Harness",
+		"DeepSeekRuntime",
+	},
+	{
+		"OhMyOpenCode",
+		"OpenCodeAgent",
+	},
+	{
 		// 反馈句：整句带 Anthropic 仓库链接，上游按整句拦截（只留链接或只留半边均不拦，
 		// 实测需整句同时出现）。give→provide 一词之差即可绕过，语义不变。
 		"To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
@@ -80,25 +115,52 @@ var sanitizeRewrites = [][2]string{
 
 // sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
 func sanitizeText(text string) string {
-	if !hasFingerprint(text) {
+	return sanitizeTextWithOpts(text, false, false)
+}
+
+func sanitizeTextWithOpts(text string, systemRole, assistantOrReasoning bool) string {
+	hasGlobal := hasFingerprint(text)
+	hasSys := systemRole && (strings.Contains(text, "workspace root") || strings.Contains(text, "Workspace root"))
+	hasInjected := assistantOrReasoning && hasInjectedIdentity(text)
+	if !hasGlobal && !hasSys && !hasInjected {
 		return text
 	}
-	for _, rw := range sanitizeRewrites {
-		text = strings.ReplaceAll(text, rw[0], rw[1])
-	}
-	if sanitizeHdrRe.MatchString(text) {
-		text = sanitizeHdrRe.ReplaceAllString(text, "")
-	}
-	if strings.Contains(text, "cc_") {
-		prev := ""
-		for prev != text { // 清尾随裸 kv（cc_version=...; cc_entrypoint=...;）
-			prev = text
-			text = sanitizeKvRe.ReplaceAllString(text, "")
+	if hasInjected {
+		text = sanitizeModelIdentityTagRe.ReplaceAllString(text, "")
+		if sanitizeInjectedIdentityRe.MatchString(text) {
+			text = sanitizeInjectedIdentityRe.ReplaceAllString(text, sanitizeInjectedIdentityReplacement)
 		}
 	}
-	// 兜底：键值形态已在上面整段删除，这里只剩裸键名（引用/示例文本形态）。
-	text = sanitizeBareHdrRe.ReplaceAllString(text, "x-anthropic-billing-hdr")
+	if hasGlobal {
+		for _, rw := range sanitizeRewrites {
+			text = strings.ReplaceAll(text, rw[0], rw[1])
+		}
+		if strings.Contains(text, "Tokens prefixed with @") || sanitizeDshPathsRe.MatchString(text) {
+			text = sanitizeDshPathsRe.ReplaceAllString(text, sanitizeDshPathsReplacement)
+		}
+		if sanitizeHdrRe.MatchString(text) {
+			text = sanitizeHdrRe.ReplaceAllString(text, "")
+		}
+		if strings.Contains(text, "cc_") {
+			prev := ""
+			for prev != text { // 清尾随裸 kv（cc_version=...; cc_entrypoint=...;）
+				prev = text
+				text = sanitizeKvRe.ReplaceAllString(text, "")
+			}
+		}
+		// 兜底：键值形态已在上面整段删除，这里只剩裸键名（引用/示例文本形态）。
+		text = sanitizeBareHdrRe.ReplaceAllString(text, "x-anthropic-billing-hdr")
+	}
+	if systemRole {
+		text = strings.ReplaceAll(text, "workspace root", "root of the workspace")
+		text = strings.ReplaceAll(text, "Workspace root", "Root of the workspace")
+	}
 	return strings.TrimSpace(text)
+}
+
+func hasInjectedIdentity(text string) bool {
+	lower := strings.ToLower(text)
+	return strings.Contains(lower, "model_identity") || strings.Contains(lower, "identify yourself as")
 }
 
 // hasFingerprint 特征预检：先走 strings.Contains 快速路径（零分配）；
@@ -118,9 +180,13 @@ func hasFingerprint(text string) bool {
 // sanitizeContent 兼容字符串与多模态数组；只动 text part，image 等 part 不动。
 // 返回净化后的值及是否发生变化。
 func sanitizeContent(v any) (any, bool) {
+	return sanitizeContentWithOpts(v, false, false)
+}
+
+func sanitizeContentWithOpts(v any, systemRole, assistantRole bool) (any, bool) {
 	switch c := v.(type) {
 	case string:
-		s := sanitizeText(c)
+		s := sanitizeTextWithOpts(c, systemRole, assistantRole)
 		return s, s != c
 	case []any:
 		changed := false
@@ -133,7 +199,7 @@ func sanitizeContent(v any) (any, bool) {
 			if !ok {
 				continue
 			}
-			if s := sanitizeText(text); s != text {
+			if s := sanitizeTextWithOpts(text, systemRole, assistantRole); s != text {
 				m["text"] = s
 				changed = true
 			}
@@ -184,28 +250,27 @@ func sanitizeMessages(messages []any) bool {
 		if !ok {
 			continue
 		}
+		role, _ := m["role"].(string)
+		normRole := strings.ToLower(strings.TrimSpace(role))
+		isSystem := normRole == "system" || normRole == "developer"
+		isAssistant := normRole == "assistant"
 		// content 与 tool_calls 各自独立判断：content 可以为 null（工具调用轮），
 		// 早期版本在此 continue，导致这类消息的 tool_calls 完全不被净化。
 		if c, ok := m["content"]; ok {
-			if nc, ch := sanitizeContent(c); ch {
+			if nc, ch := sanitizeContentWithOpts(c, isSystem, isAssistant); ch {
 				m["content"] = nc
 				changed = true
 			}
 		}
-		// reasoning_content（思维链回填字段，见 thinking.go/sse.go）实测同样
-		// 携带指纹，与 content 同等净化。string 形态直接走 sanitizeText。
+		// reasoning_content / reasoning：任意消息思维链均执行注入身份句/标签清洗，避免回流滚雪球。
 		if rc, ok := m["reasoning_content"].(string); ok {
-			if s := sanitizeText(rc); s != rc {
+			if s := sanitizeTextWithOpts(rc, isSystem, true); s != rc {
 				m["reasoning_content"] = s
 				changed = true
 			}
 		}
-		// reasoning：另一形态的思维链字段。thinking.go 的回填会把客户端送来的
-		// reasoning_content 镜像进 reasoning（反之亦然），而此前只洗 content /
-		// reasoning_content / tool_calls —— 镜像进 reasoning 的指纹原样出站，
-		// 裸 "11128" 这种反探测串同样致命。
 		if r, ok := m["reasoning"].(string); ok {
-			if s := sanitizeText(r); s != r {
+			if s := sanitizeTextWithOpts(r, isSystem, true); s != r {
 				m["reasoning"] = s
 				changed = true
 			}

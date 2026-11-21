@@ -47,6 +47,12 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		return "request context exceeds the model's limit; reduce history/message size"
 	case ErrImageInvalid:
 		return "image request was rejected by upstream; check image_url format and image data"
+	case ErrEmptyContent:
+		return "request message contains an empty text content segment; remove or fill empty text content"
+	case ErrToolMismatch:
+		return "assistant tool_calls and tool results sequence do not match; ensure every tool call has a matching tool result immediately following"
+	case ErrModelParamInvalid:
+		return "request parameters were rejected by the model provider; check message format and model capabilities"
 	case ErrWafBlock:
 		// 账号级 WAF 403 与 IP 级 fail-fast 同 hint：两者对客户端的动作一致
 		// （等待窗口过去再试，换号/立刻重试无意义）。
@@ -63,6 +69,9 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 	case ErrHardCredit:
 		return "account credits exhausted at upstream; waiting for daily check-in to restore"
 	case ErrUpstreamBusy:
+		if hasBusinessCode(msg, "11134") || codeMarker(strings.ToLower(msg), "11134") {
+			return "upstream model provider is overloaded (11134); retry after a short wait"
+		}
 		// 6021 queue.full：渠道级容量满载。措辞明确「不是账号问题、换号无意义」，
 		// 指引客户端等待后重试（SDK 指数退避天然适配）。
 		return "upstream capacity is full (queue.full); this is a channel-level issue, not an account problem; retry after a short wait"
@@ -106,19 +115,27 @@ func FrameHintFunc(ctxFn func() HintContext) func(string) string {
 	}
 }
 
-// FrameKind 从 SSE error 帧 payload 判定 ErrKind：6004 模型级限流的流式形态
-// （IsModelRateLimit 对帧 JSON 直接命中）优先；其余取帧内 error.message 走
-// Classify（请求级 400 口径）。判不出 → ErrNone（无 hint）。
+// FrameKind 从 SSE error 帧 payload 判定 ErrKind：6004 模型级限流与 11140 账号级限制优先
+// （整体帧结构化判断），再按整体 JSON 走 Classify(400, payload)，最后回退到 error.message。
 func FrameKind(payload string) ErrKind {
 	if IsModelRateLimit(payload) {
 		return ErrSoftRate
+	}
+	if IsAccountRestriction(payload) {
+		return ErrAccountFault
 	}
 	var f struct {
 		Error struct {
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if json.Unmarshal([]byte(payload), &f) != nil || f.Error.Message == "" {
+	if json.Unmarshal([]byte(payload), &f) != nil {
+		return ErrNone
+	}
+	if k := Classify(http.StatusBadRequest, payload); k != ErrNone && k != ErrClient {
+		return k
+	}
+	if f.Error.Message == "" {
 		return ErrNone
 	}
 	return Classify(http.StatusBadRequest, f.Error.Message)

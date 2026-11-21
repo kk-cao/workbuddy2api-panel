@@ -2,9 +2,13 @@ package upstream
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+var uuidV4Pattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+var uuidV7Pattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 // extractCacheKey 从改写后的 body 里取出 prompt_cache_key 字段值。
 func extractCacheKey(t *testing.T, body []byte) string {
@@ -44,11 +48,11 @@ func TestInjectPromptCacheKey_UsesConversationID(t *testing.T) {
 
 	out := InjectPromptCacheKey([]byte(in), uid, "")
 	got := extractCacheKey(t, out)
-	if !strings.HasPrefix(got, "wb2a-") {
-		t.Fatalf("expected wb2a- prefix, got=%q", got)
+	if !uuidV4Pattern.MatchString(got) {
+		t.Fatalf("expected UUIDv4 prompt_cache_key, got=%q", got)
 	}
-	if !strings.Contains(got, "user-abc") {
-		t.Fatalf("expected uid8 isolation prefix, got=%q", got)
+	if strings.Contains(got, "wb2a-") || strings.Contains(got, "user-abc") {
+		t.Fatalf("prompt_cache_key must not leak gateway prefix or raw uid, got=%q", got)
 	}
 	// 同 conversation_id 两次出站 → 同 key（稳定）。
 	out2 := InjectPromptCacheKey([]byte(in), uid, "")
@@ -89,8 +93,8 @@ func TestInjectPromptCacheKey_AccountIsolation(t *testing.T) {
 	if ka == kb {
 		t.Fatalf("cross-account key collision: both=%q", ka)
 	}
-	if !strings.HasPrefix(ka, "wb2a-") || !strings.HasPrefix(kb, "wb2a-") {
-		t.Fatalf("keys must carry wb2a- prefix: a=%q b=%q", ka, kb)
+	if !uuidV4Pattern.MatchString(ka) || !uuidV4Pattern.MatchString(kb) {
+		t.Fatalf("keys must be valid UUIDv4: a=%q b=%q", ka, kb)
 	}
 }
 
@@ -101,17 +105,16 @@ func TestInjectPromptCacheKey_Format(t *testing.T) {
 	in := `{"model":"glm-5.2","messages":[]}`
 	out := InjectPromptCacheKey([]byte(in), uid, "conv-fmt")
 	got := extractCacheKey(t, out)
-	if !strings.HasPrefix(got, "wb2a-") {
-		t.Fatalf("expected wb2a- prefix, got=%q", got)
+	if !uuidV4Pattern.MatchString(got) {
+		t.Fatalf("expected UUIDv4 cache key, got=%q", got)
 	}
-	if !strings.Contains(got, "12345678") {
-		t.Fatalf("expected uid8 (12345678) in key, got=%q", got)
+	if strings.Contains(got, "wb2a-") || strings.Contains(got, "12345678") {
+		t.Fatalf("cache key must not leak gateway prefix or raw uid, got=%q", got)
 	}
 }
 
 // TestInjectPromptCacheKey_EmptyConversation 覆盖任务用例 3 边界：
-// 无 conversation_id 且无会话标识 → 生成键含 uid8 但 conversationHash 段为定值（不复用前缀）。
-// 不应报错、不应空串（key 非空）。
+// 无 conversation_id 且无会话标识 → 生成确定性 UUIDv4，按 uid 隔离但不漏出 uid。
 func TestInjectPromptCacheKey_EmptyConversation(t *testing.T) {
 	uid := "user-abc-123"
 	in := `{"model":"glm-5.2","messages":[]}`
@@ -120,11 +123,11 @@ func TestInjectPromptCacheKey_EmptyConversation(t *testing.T) {
 	if got == "" {
 		t.Fatalf("expected non-empty key when no conversation, got empty")
 	}
-	if !strings.HasPrefix(got, "wb2a-") {
-		t.Fatalf("expected wb2a- prefix, got=%q", got)
+	if !uuidV4Pattern.MatchString(got) {
+		t.Fatalf("expected UUIDv4 prompt_cache_key, got=%q", got)
 	}
-	if !strings.Contains(got, "user-abc") {
-		t.Fatalf("expected uid8 in key, got=%q", got)
+	if strings.Contains(got, "wb2a-") || strings.Contains(got, "user-abc") {
+		t.Fatalf("prompt_cache_key must not leak gateway prefix or raw uid, got=%q", got)
 	}
 }
 
@@ -140,5 +143,23 @@ func TestPrepareBodyOptNoCacheKeyInjection(t *testing.T) {
 	}
 	if _, present := obj["prompt_cache_key"]; present {
 		t.Fatalf("PrepareBodyOpt must NOT inject prompt_cache_key, but got: %v", obj["prompt_cache_key"])
+	}
+}
+
+func TestBuildTimeOrderedUUID(t *testing.T) {
+	k1 := buildTimeOrderedUUID("u1", "conv1", "")
+	k2 := buildTimeOrderedUUID("u1", "conv1", "")
+	k3 := buildTimeOrderedUUID("u2", "conv1", "")
+	k4 := buildTimeOrderedUUID("u1", "conv1", "acp")
+	for _, k := range []string{k1, k2, k3, k4} {
+		if !uuidV7Pattern.MatchString(k) {
+			t.Fatalf("expected UUIDv7, got=%q", k)
+		}
+	}
+	if k1 != k2 {
+		t.Errorf("same inputs must be deterministic: %q != %q", k1, k2)
+	}
+	if k1 == k3 || k1 == k4 {
+		t.Errorf("different uid or purpose must differ: k1=%q k3=%q k4=%q", k1, k3, k4)
 	}
 }

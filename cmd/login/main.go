@@ -38,7 +38,7 @@ import (
 const (
 	upstreamBaseCN      = "https://copilot.tencent.com"
 	upstreamBaseGlobal  = "https://www.workbuddy.ai"
-	clientUA            = "CLI/2.165.0 CodeBuddy/2.165.0"
+	clientUA            = "CLI/2.176.0 CodeBuddy/2.176.0"
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
 )

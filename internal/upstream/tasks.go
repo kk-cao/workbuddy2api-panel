@@ -97,6 +97,7 @@ func (c *Client) growthJSONMP(a *auth.Auth, method, path string, body any) (json
 		return nil, err
 	}
 	c.BillingHeaders(req, a)
+	c.dropClientIdentityHeaders(req)
 	req.Header.Set("X-Client-Platform", mpPlatform)
 	return c.doJSON(req)
 }
@@ -118,6 +119,7 @@ func (c *Client) ClaimRewardMP(a *auth.Auth, taskCode string) (credit, energy in
 		return 0, 0, err
 	}
 	c.BillingHeaders(req, a)
+	c.dropClientIdentityHeaders(req)
 	req.Header.Set("X-Client-Platform", mpPlatform)
 	data, err := c.doJSON(req)
 	if err != nil {

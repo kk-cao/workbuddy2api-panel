@@ -48,8 +48,12 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 	if gotHdr.Get("X-CodeBuddy-Request") != "1" {
 		t.Errorf("X-CodeBuddy-Request=%q want 1", gotHdr.Get("X-CodeBuddy-Request"))
 	}
-	if gotHdr.Get("Accept-Language") != "zh-CN" {
-		t.Errorf("Accept-Language=%q want zh-CN", gotHdr.Get("Accept-Language"))
+	if gotHdr.Get("Accept-Language") != "" {
+		t.Errorf("Accept-Language=%q want empty (RPC no longer sends Accept-Language)", gotHdr.Get("Accept-Language"))
+	}
+	if gotHdr.Get("X-Client-Version") != defaultClientVersion || gotHdr.Get("X-Client-Platform") != "windows" || gotHdr.Get("X-Client-Product") != "WorkBuddy" {
+		t.Errorf("unexpected X-Client-* headers: ver=%q plat=%q prod=%q",
+			gotHdr.Get("X-Client-Version"), gotHdr.Get("X-Client-Platform"), gotHdr.Get("X-Client-Product"))
 	}
 	if gotHdr.Get("X-Device-Token") != "dt-1" {
 		t.Errorf("X-Device-Token=%q want dt-1", gotHdr.Get("X-Device-Token"))
@@ -64,8 +68,8 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 	if ev["ideType"] != "WorkBuddy" || ev["ideName"] != "WorkBuddy" {
 		t.Errorf("ideType/ideName=%v/%v want WorkBuddy", ev["ideType"], ev["ideName"])
 	}
-	if ev["ideVersion"] != "5.9.3" || ev["extVersion"] != "5.9.3" {
-		t.Errorf("ideVersion/extVersion=%v/%v want 5.9.3", ev["ideVersion"], ev["extVersion"])
+	if ev["ideVersion"] != "5.11.3" || ev["extVersion"] != "5.11.3" {
+		t.Errorf("ideVersion/extVersion=%v/%v want 5.11.3", ev["ideVersion"], ev["extVersion"])
 	}
 	if ev["userId"] != "u-dt" {
 		t.Errorf("userId=%v want u-dt", ev["userId"])
@@ -76,15 +80,16 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 	if ev["mode"] != "craft" {
 		t.Errorf("业务字段 mode=%v 被指纹覆盖或缺失", ev["mode"])
 	}
-	// machineId / sessionId 应与请求头 X-Machine-ID / X-Session-ID 完全一致（36 hex）。
-	if len(ev["machineId"].(string)) != 36 {
-		t.Errorf("machineId 长度=%d want 36", len(ev["machineId"].(string)))
+	// machineId / sessionId 保留在 JSON body 中且为 36 hex；HTTP 请求头不再发送 X-Machine-ID / X-Session-ID。
+	if len(ev["machineId"].(string)) != 36 || ev["machineId"] != deriveAccountStableID("u-dt", "machine") {
+		t.Errorf("ev.machineId=%v want 36-char stable machine ID", ev["machineId"])
 	}
-	if ev["machineId"] != gotHdr.Get("X-Machine-ID") {
-		t.Errorf("ev.machineId=%v != X-Machine-ID=%q", ev["machineId"], gotHdr.Get("X-Machine-ID"))
+	if len(ev["sessionId"].(string)) != 36 || ev["sessionId"] != deriveAccountStableID("u-dt", "session") {
+		t.Errorf("ev.sessionId=%v want 36-char stable session ID", ev["sessionId"])
 	}
-	if ev["sessionId"] != gotHdr.Get("X-Session-ID") {
-		t.Errorf("ev.sessionId=%v != X-Session-ID=%q", ev["sessionId"], gotHdr.Get("X-Session-ID"))
+	if gotHdr.Get("X-Machine-ID") != "" || gotHdr.Get("X-Session-ID") != "" {
+		t.Errorf("X-Machine-ID/X-Session-ID HTTP headers must not be sent, got %q / %q",
+			gotHdr.Get("X-Machine-ID"), gotHdr.Get("X-Session-ID"))
 	}
 }
 
@@ -178,11 +183,13 @@ func assertDesktopCommonHeaders(t *testing.T, hdr http.Header, uid string) {
 	if hdr.Get("X-CodeBuddy-Request") != "1" {
 		t.Errorf("X-CodeBuddy-Request=%q want 1", hdr.Get("X-CodeBuddy-Request"))
 	}
-	if hdr.Get("X-Machine-ID") != deriveAccountStableID(uid, "machine") || len(hdr.Get("X-Machine-ID")) != 36 {
-		t.Errorf("X-Machine-ID=%q want 36-char stable machine ID", hdr.Get("X-Machine-ID"))
+	if hdr.Get("X-Machine-ID") != "" || hdr.Get("X-Session-ID") != "" || hdr.Get("Accept-Language") != "" {
+		t.Errorf("desktop headers must not send X-Machine-ID/X-Session-ID/Accept-Language, got %q/%q/%q",
+			hdr.Get("X-Machine-ID"), hdr.Get("X-Session-ID"), hdr.Get("Accept-Language"))
 	}
-	if hdr.Get("X-Session-ID") != deriveAccountStableID(uid, "session") || len(hdr.Get("X-Session-ID")) != 36 {
-		t.Errorf("X-Session-ID=%q want 36-char stable session ID", hdr.Get("X-Session-ID"))
+	if hdr.Get("X-Client-Version") != defaultClientVersion || hdr.Get("X-Client-Platform") != "windows" || hdr.Get("X-Client-Product") != "WorkBuddy" {
+		t.Errorf("unexpected X-Client-* headers: ver=%q plat=%q prod=%q",
+			hdr.Get("X-Client-Version"), hdr.Get("X-Client-Platform"), hdr.Get("X-Client-Product"))
 	}
 }
 

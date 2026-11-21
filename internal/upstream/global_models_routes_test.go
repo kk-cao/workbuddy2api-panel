@@ -2,6 +2,8 @@ package upstream
 
 import (
 	"errors"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -140,27 +142,94 @@ func TestNonChatModelGenerationTags(t *testing.T) {
 	}
 }
 
-// TestDesktopUAForGlobalAccount 桌面端 UA 平台段两个 realm 相同（均为 `WorkBuddy`）。
-// 依据：CN 5.8.3 与国际版 5.8.4 官方安装包的 app.asar 里是同一段硬编码
-// `[`WorkBuddy/${ver}`,`WorkBuddy/${ver}`,...CLI/...]`；国际版 productName 虽为
-// `WorkBuddy AI`，出站 UA 第二段仍是字面量 `WorkBuddy`。版本段仍按 realm 分档。
+// TestDesktopUAForGlobalAccount 验证 global 桌面端 UA 首段恒驼峰 WorkBuddy、第二段为 slug workbuddy-ai。
 func TestDesktopUAForGlobalAccount(t *testing.T) {
 	c := New()
 	global := &auth.Auth{UID: "u1", Domain: "www.workbuddy.ai"}
 	global.BackfillRealm()
 	ua := c.defaultWorkBuddyUAFor(global)
 	if contains(ua, "WorkBuddy AI") {
-		t.Errorf("global desktop UA = %q, must not contain 'WorkBuddy AI'（真实客户端不发该平台段）", ua)
+		t.Errorf("global desktop UA = %q, must not contain 'WorkBuddy AI'", ua)
 	}
-	if want := "WorkBuddy/" + defaultClientVersionGlobal + " WorkBuddy/" + defaultClientVersionGlobal + " CLI/"; !contains(ua, want) {
+	if want := "WorkBuddy/" + defaultClientVersionGlobal + " workbuddy-ai/" + defaultClientVersionGlobal + " CLI/"; !contains(ua, want) {
 		t.Errorf("global desktop UA = %q, want prefix %q", ua, want)
 	}
-	// CN 账号同平台段，版本段不同。
 	cn := &auth.Auth{UID: "u2", Domain: "copilot.tencent.com"}
 	cn.BackfillRealm()
-	if ua := c.defaultWorkBuddyUAFor(cn); !contains(ua, "WorkBuddy/"+defaultClientVersion+" ") {
+	if ua := c.defaultWorkBuddyUAFor(cn); !contains(ua, "WorkBuddy/"+defaultClientVersion+" WorkBuddy/"+defaultClientVersion+" ") {
 		t.Errorf("cn desktop UA = %q, want CN version segment", ua)
 	}
+}
+
+func TestFetchGlobalModelsPersonalSkipsEnterpriseOnV3OKAndFallbacksOnFail(t *testing.T) {
+	t.Run("personal account skips enterprise endpoints when v3/config succeeds", func(t *testing.T) {
+		entCalled := 0
+		c := testClient(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/v3/config") {
+				return jsonResp(200, `{"code":0,"data":{"models":[{"id":"deepseek-v4.1","maxInputTokens":128000,"maxOutputTokens":32000}]}}`), nil
+			}
+			entCalled++
+			return jsonResp(500, `<html>error</html>`), nil
+		})
+		a := &auth.Auth{UID: "p1", AccessToken: "at", Domain: "www.workbuddy.ai"}
+		a.BackfillRealm()
+		names, _, _, _, err := c.probeGlobalModels(a)
+		if err != nil {
+			t.Fatalf("probeGlobalModels: %v", err)
+		}
+		if entCalled != 0 {
+			t.Errorf("personal global account called enterprise endpoint %d times when /v3/config succeeded (want 0)", entCalled)
+		}
+		if len(names) != 1 || names[0] != "deepseek-v4.1" {
+			t.Errorf("names=%v want [deepseek-v4.1]", names)
+		}
+	})
+
+	t.Run("personal account falls back to enterprise endpoints when v3/config fails", func(t *testing.T) {
+		entCalled := 0
+		c := testClient(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/v3/config") {
+				return jsonResp(500, `{"code":500}`), nil
+			}
+			entCalled++
+			return jsonResp(200, `{"code":0,"data":{"models":[{"id":"glm-5.2","maxInputTokens":128000,"maxOutputTokens":32000}],"agents":[{"name":"cli","models":["glm-5.2"]}]}}`), nil
+		})
+		a := &auth.Auth{UID: "p1", AccessToken: "at", Domain: "www.workbuddy.ai"}
+		a.BackfillRealm()
+		names, _, _, _, err := c.probeGlobalModels(a)
+		if err != nil {
+			t.Fatalf("fallback failed: %v", err)
+		}
+		if entCalled == 0 {
+			t.Errorf("expected enterprise fallback call when /v3/config failed")
+		}
+		if len(names) != 1 || names[0] != "glm-5.2" {
+			t.Errorf("names=%v want [glm-5.2]", names)
+		}
+	})
+
+	t.Run("enterprise account probes both v3/config and enterprise endpoint", func(t *testing.T) {
+		entCalled := 0
+		c := testClient(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/v3/config") {
+				return jsonResp(200, `{"code":0,"data":{"models":[{"id":"m-v3","maxInputTokens":128000,"maxOutputTokens":32000}]}}`), nil
+			}
+			entCalled++
+			return jsonResp(200, `{"code":0,"data":{"models":[{"id":"m-ent","maxInputTokens":128000,"maxOutputTokens":32000}],"agents":[{"name":"cli","models":["m-ent"]}]}}`), nil
+		})
+		a := &auth.Auth{UID: "e1", AccessToken: "at", EnterpriseID: "ent-1", Domain: "www.workbuddy.ai"}
+		a.BackfillRealm()
+		names, _, _, _, err := c.probeGlobalModels(a)
+		if err != nil {
+			t.Fatalf("enterprise fetch failed: %v", err)
+		}
+		if entCalled == 0 {
+			t.Errorf("enterprise account must still probe enterprise endpoint")
+		}
+		if len(names) != 2 {
+			t.Errorf("names=%v want both v3 and enterprise models", names)
+		}
+	})
 }
 
 func contains(s, sub string) bool {

@@ -11,8 +11,9 @@ package upstream
 
 import (
 	"crypto/sha256"
-	"encoding/hex"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -60,22 +61,59 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 	return out
 }
 
-// buildCacheKey 生成 `wb2a-<uid8>-<convHex>` 格式的稳定 cache key。
-//
-// uid8 提供账号隔离段；convHex = sha256(uid + conversationID)[:16] 的 hex 提供会话段
-// （同账号同会话稳定、不同会话不同）。会话源为空时 convHex 仍由 uid 单独哈希，
-// 保证跨账号绝不碰撞但同一空会话不复用（空会话 = 新会话语义）。
+// cacheKeySource prompt_cache_key 的会话段来源：客户端声明的会话（ConversationID）优先，
+// 否则用网关派生的粘性会话键（CacheKeyID，见 ChatMeta）。
+func cacheKeySource(meta ChatMeta) string {
+	if meta.ConversationID != "" {
+		return meta.ConversationID
+	}
+	return meta.CacheKeyID
+}
+
+// buildCacheKey 生成与官方客户端同形的会话标识：标准 RFC 4122 UUID v4（36 字符）。
+// 剥除旧版 `wb2a-<uid8>-` 网关指纹前缀与明文 uid8，保留 uid 哈希隔离与同会话稳定槽。
 func buildCacheKey(uid, conversation string) string {
-	uid8 := uid
-	if len(uid8) > 8 {
-		uid8 = uid8[:8]
+	return buildStableUUID(uid, conversation, "")
+}
+
+// buildStableUUID 由 (uid, conversation, purpose) 稳定派生 RFC 4122 UUIDv4。
+func buildStableUUID(uid, conversation, purpose string) string {
+	in := uid + "|" + conversation
+	if purpose != "" {
+		in += "|" + purpose
 	}
-	if uid8 == "" {
-		uid8 = "-"
+	sum := sha256.Sum256([]byte(in))
+	var u [16]byte
+	copy(u[:], sum[:16])
+	u[6] = (u[6] & 0x0f) | 0x40 // version 4
+	u[8] = (u[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
+}
+
+// buildTimeOrderedUUID 由 (uid, conversation, purpose) 稳定派生 UUIDv7（48 bit 确定性伪时间戳
+// + 版本 7 + RFC 4122 变体位），用于需要与真机 01xxxxxx-...-7xxx 同形的 X-Conversation-ID。
+func buildTimeOrderedUUID(uid, conversation, purpose string) string {
+	in := uid + "|" + conversation
+	if purpose != "" {
+		in += "|" + purpose
 	}
-	sum := sha256.Sum256([]byte(uid + "|" + conversation))
-	convHex := hex.EncodeToString(sum[:16])
-	return "wb2a-" + uid8 + "-" + convHex
+	sum := sha256.Sum256([]byte(in))
+	const (
+		anchorMS = int64(1767225600000)                 // 2026-01-01T00:00:00Z
+		windowMS = int64(24 * 30 * 24 * 60 * 60 * 1000) // ~24 个月窗口
+	)
+	ms := uint64(anchorMS + int64(binary.BigEndian.Uint64(sum[8:16])%uint64(windowMS)))
+	var u [16]byte
+	u[0] = byte(ms >> 40)
+	u[1] = byte(ms >> 32)
+	u[2] = byte(ms >> 24)
+	u[3] = byte(ms >> 16)
+	u[4] = byte(ms >> 8)
+	u[5] = byte(ms)
+	copy(u[6:], sum[:10])
+	u[6] = (u[6] & 0x0f) | 0x70 // version 7
+	u[8] = (u[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
 }
 
 // strField 从 map 取 string 字段，非 string 或空串返回 ""。

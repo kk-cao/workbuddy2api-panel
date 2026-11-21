@@ -23,6 +23,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -36,10 +37,13 @@ const (
 	ErrNotFound                      // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
 	ErrServer                        // 5xx 上游故障
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
-	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
-	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
-	ErrChannelRefused                // 11128 request illegal 通道校验失败（上游认为请求不是官方客户端发的）→ 不罚账号
-	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
+	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101 / 11129 / 11152）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
+	ErrEmptyContent                  // 11151「a message has empty content」→ 请求级错误：不罚号、不轮转，末端 400
+	ErrToolMismatch                  // 11148「tool_call_sequence_broken / tool calls and tool results do not match」→ 请求级错误：不罚号、不轮转，末端 400
+	ErrModelParamInvalid             // 11133「model_param_invalid」→ 请求级错误：不罚号、不轮转，末端 400
+	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换或停手禁用
+	ErrChannelRefused                // 11128 request illegal 通道校验失败（上游认为请求不是官方客户端发的）→ 不罚账号，请求级快速失败
+	ErrModelBlocked                  // 11102「该后端无此模型」/ 11158「该账号类型无此模型权限」→ (账号,模型) 负缓存避让
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
@@ -63,6 +67,12 @@ func (k ErrKind) String() string {
 		return "content_blocked"
 	case ErrBadParams:
 		return "bad_params"
+	case ErrEmptyContent:
+		return "empty_content"
+	case ErrToolMismatch:
+		return "tool_mismatch"
+	case ErrModelParamInvalid:
+		return "model_param_invalid"
 	case ErrModelBlocked:
 		return "model_blocked"
 	case ErrWafBlock:
@@ -147,38 +157,14 @@ func isQueueFullBody(lower string) bool {
 // 注意 **"request illegal" 不能作为通用 marker**：WorkBuddy 的 11128 通道校验失败
 // （`{"code":"11-128","msg":"request illegal"}`，displayTips 明确说「可能不是官方客户端
 // 发送」）与 11140 账号限制（`{"code":11140,"msg":"request illegal"}`）文案完全相同。
-// 只看文案会把一次通道校验失败误判成账号封禁并硬禁用健康账号。11140 的判定统一走
-// IsAccountRestricted（code + 文案双条件），不放进本词表。
-// 另：11140 **不能**按 code 单独判定——该 code 也承载模型级限流文案（"The model
-// provider is rate-limiting requests."），那种场景必须保持 ErrSoftRate（下方
-// softRateMarkers 后判定）。
+// accountFaultMarkers 非 11140 账号级未激活文案。
 var accountFaultMarkers = []string{
 	"trial not activated",
 	"trial version is not yet activated",
 }
 
-// accountRestrictedMsg 是 WorkBuddy 11140 账号限制的正文关键词。
+// accountRestrictedMsg 是 WorkBuddy 11140 / 11128 常见正文关键词。
 const accountRestrictedMsg = "request illegal"
-
-// IsAccountRestricted 报告上游 body 是否为 WorkBuddy 的账号级限制（11140
-// "request illegal"）。必须 code + 文案双条件：
-//   - 只看文案："request illegal" 也出现在 11128 通道校验失败里（健康账号）；
-//   - 只看 code：11140 也承载模型级限流文案（应归 ErrSoftRate）。
-func IsAccountRestricted(body string) bool {
-	lower := strings.ToLower(body)
-	if !strings.Contains(lower, accountRestrictedMsg) {
-		return false
-	}
-	// 11140 也承载**模型级限流**文案（displayMsg "The model provider is rate-limiting
-	// requests."）：那时账号健康，属软限流。code + "request illegal" 双条件仍会命中，
-	// 故必须显式排除限流语义（对齐上游 509e7a6）。误禁用代价远高于一次短冷却。
-	for _, m := range softRateMarkers {
-		if strings.Contains(lower, m) {
-			return false
-		}
-	}
-	return hasBusinessCode(body, "11140")
-}
 
 // isChannelRefused 报告上游 body 是否为 WorkBuddy 的通道校验失败（11128
 // "request illegal"）。11128 还承载内容审核变体（"blocked by security policy"，
@@ -344,6 +330,12 @@ func ModelBlockReasonFor(body string) string {
 		return ModelForbiddenReason
 	}
 	return ModelBlockReason
+}
+
+// IsBackendModelMissing 报告响应是否为 11102「该后端无此模型」（用于同域单次快速失败；区分于 11158 账号权限差异）。
+func IsBackendModelMissing(body string) bool {
+	code, msg := modelBlockFields(body)
+	return code == modelBlockCode || strings.Contains(strings.ToLower(msg), modelBlockMsgMarker)
 }
 
 // modelBlockFields 提取顶层或 error 子对象中的业务 code 与消息。
@@ -631,7 +623,7 @@ func Classify(status int, body string) ErrKind {
 	if isChannelRefused(body) {
 		return ErrChannelRefused
 	}
-	if IsAccountRestricted(body) {
+	if IsAccountRestriction(body) {
 		return ErrAccountFault
 	}
 	for _, m := range accountFaultMarkers {
@@ -717,13 +709,23 @@ func Classify(status int, body string) ErrKind {
 				return ErrContentBlocked
 			}
 		}
-		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
-		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
-		// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
-		// 归 ErrBadParams：不冷却/不熔断/不计错，且**不轮转**——11101 发生在上游解析
-		// 请求体阶段，还没走到模型路由，所以"不同账号可能有不同模型权限"其实是
-		// 11102（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让。
-		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
+		if hasBusinessCode(body, "11151") || codeMarker(lower, "11151") || strings.Contains(lower, "a message has empty content") {
+			return ErrEmptyContent
+		}
+		if hasBusinessCode(body, "11148") || codeMarker(lower, "11148") ||
+			strings.Contains(lower, "tool_call_sequence_broken") ||
+			strings.Contains(lower, "tool calls and tool results do not match") {
+			return ErrToolMismatch
+		}
+		if isModelParamInvalid(body) {
+			return ErrModelParamInvalid
+		}
+		// 请求体解析失败 / 工具定义参数不合规（11101 / 11129 / 11152）：
+		// 同一 body 换账号照样 400，不罚号、不轮转。
+		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) ||
+			hasBusinessCode(body, "11129") || codeMarker(lower, "11129") ||
+			hasBusinessCode(body, "11152") || codeMarker(lower, "11152") ||
+			strings.Contains(lower, "invalid_function_call_parameters") {
 			return ErrBadParams
 		}
 		return ErrClient
@@ -1265,10 +1267,14 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
+	if meta.ConversationRequestID == "" {
+		meta.ConversationRequestID = session.NewMessageID()
+	}
+	prepared := c.prepareBody(body, a.Realm(), a.UID, cacheKeySource(meta))
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
+	prepared = injectConversationFields(prepared, meta.ConversationRequestID)
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
@@ -1462,19 +1468,12 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 // 官方 IDE 头 `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0` 才返回完整能力
 // （flash：393216 + low/high/max）。
 // 版本号需随上游 IDE 发版跟进：UAn 版本过旧时该端点可能同样返回精简目录。
-const codeBuddyIDEUA = "CodeBuddyIDE/4.12.2 CodeBuddy/4.12.2"
+// codeBuddyIDEUA /v3/config 要求能解析出 CodeBuddy 版本号的 UA（跟随 CN IDE 4.12.4）。
+const codeBuddyIDEUA = "CodeBuddyIDE/4.12.4 CodeBuddy/4.12.4"
 
-// codeBuddyCLIUA CLI 三段式 UA。**实测（2026-09-22）该端点对不同 UA 下发的模型集合不同**：
-//   - IDE UA  → 14 条（10 个 chat：含 o4-mini / enhance-1.0 / auto-chat，**无 deepseek 系列**）
-//   - CLI UA  → 22 条（22 个 chat：**含 deepseek-v4.1-flash / deepseek-v4.1-flash-sg /
-//     gpt-6-astra / kimi-k2.8-preview**，但无 o4-mini / enhance-1.0 / auto-chat）
-//
-// 注意两点，都与旧注释相反，勿再按旧注释推断：
-//  1. 旧注释称「CLI UA 拿到精简目录、IDE UA 才返回完整能力」——实测模型数量恰好相反，
-//     但 **IDE 响应体积更大**（26003B vs 21111B），故「完整能力」应理解为**单条字段更全**，
-//     而非模型更多。两路各有独有模型，缺一不可。
-//  2. 该常量仅用于 global 侧第二路探测；CN 侧仍走 codeBuddyIDEUA 单路。
-const codeBuddyCLIUA = "CLI/2.179.3 CodeBuddy/2.179.3"
+// codeBuddyCLIUA CLI 三段式 UA（跟随 npm @tencent-ai/codebuddy-code 2.185.0）。
+// 该常量仅用于 global 侧第二路探测；CN 侧仍走 codeBuddyIDEUA 单路。
+const codeBuddyCLIUA = "CLI/2.185.0 CodeBuddy/2.185.0"
 
 // FetchModels 调上游动态模型接口（CN 侧；global 账号见 global_models.go 家族）。
 //
@@ -1937,7 +1936,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		ua = codeBuddyIDEUA
 	}
 	req.Header.Set("User-Agent", ua)
-	c.injectCodeBuddyRequest(req)
+	c.injectClientIdentityHeaders(req, a)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err

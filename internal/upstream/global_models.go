@@ -208,9 +208,7 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 	// 此前并发 IDE/CLI 两路取并集（多拿 auto-chat / deep-model / o4-mini /
 	// enhance-1.0 等 4 个 chat 模型），代价是同一账号秒级出现三种客户端身份。
 	// 若日后需要这些模型，恢复对应 probeV3(...) 行并在下方 mergeV3Routes 里加回。
-	v3DesktopCh := probeV3(c.modelsProbeUA(a))
-	enterpriseCh := make(chan probeResult, 1)
-	go func() {
+	probeEnterprise := func() probeResult {
 		// 企业端点家族：/v2 首选 → /console 兜底（既有探活序，零回归）。
 		var lastErr error
 		for _, path := range globalModelsProbePaths {
@@ -219,13 +217,27 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 				lastErr = perr
 				continue
 			}
-			enterpriseCh <- probeResult{names: names, infos: infos}
-			return
+			return probeResult{names: names, infos: infos}
 		}
-		enterpriseCh <- probeResult{err: lastErr}
-	}()
-	v3Desktop := <-v3DesktopCh
-	enterprise := <-enterpriseCh
+		return probeResult{err: lastErr}
+	}
+	var v3Desktop, enterprise probeResult
+	personalOnly := a == nil || !a.IsEnterprise()
+	if personalOnly {
+		v3Desktop = <-probeV3(c.modelsProbeUA(a))
+		if v3Desktop.err != nil || (len(v3Desktop.names) == 0 && len(v3Desktop.infos) == 0) {
+			// 个人号 /v3/config 失败时降级尝试企业端点（成功时不再打 /console/enterprises/personal/models 免 500 HTML 告警）
+			enterprise = probeEnterprise()
+		}
+	} else {
+		v3DesktopCh := probeV3(c.modelsProbeUA(a))
+		enterpriseCh := make(chan probeResult, 1)
+		go func() {
+			enterpriseCh <- probeEnterprise()
+		}()
+		v3Desktop = <-v3DesktopCh
+		enterprise = <-enterpriseCh
+	}
 	// v3 三路自合并：桌面端路字段权威（主路），IDE/CLI 只补主路缺失的模型 id
 	// （只补 id，字段仍取自各自条目——主路没有该 id 时才轮到它们）。
 	// 逐路容错：全失败才带 err 进入下游降级判断，部分失败 warn 后继续。
@@ -235,6 +247,13 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 	}{
 		{"desktop-UA", v3Desktop},
 	})
+	if personalOnly && v3.err == nil && enterprise.err == nil && len(enterprise.names) == 0 && len(enterprise.infos) == 0 {
+		v3Names, v3Infos, v3Efforts, v3Defaults := extractEfforts(v3.infos)
+		if len(v3Names) == 0 {
+			v3Names = v3.names
+		}
+		return v3Names, v3Infos, v3Efforts, v3Defaults, nil
+	}
 
 	if v3.err != nil && enterprise.err != nil {
 		// 两路全失败 → 负缓存语义（等价原家族端点全非 2xx）。

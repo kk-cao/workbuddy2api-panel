@@ -8,10 +8,8 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
-// TestChatHeadersAlwaysSendConversationTrio 回归 issue #190：国际端点收紧通道
-// 校验后，缺 X-Conversation-ID 的聊天请求会 400 / 11128（conversation id
-// missing）。即使调用方没给会话 ID（零值 ChatMeta），三元组也必须齐全，
-// 且兜底 ID 是 32 位 hex。
+// TestChatHeadersAlwaysSendConversationTrio 验证零值 ChatMeta 下会话与 B3/W3C 头族形态齐全，
+// 且 X-Conversation-ID 符合 UUIDv7 形态、X-Trace-ID 独立于 X-Conversation-Request-ID。
 func TestChatHeadersAlwaysSendConversationTrio(t *testing.T) {
 	c := &Client{}
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/v2/chat/completions", nil)
@@ -20,26 +18,41 @@ func TestChatHeadersAlwaysSendConversationTrio(t *testing.T) {
 	}
 	c.ChatHeaders(req, testAuth(), "", ChatMeta{})
 
+	v := req.Header.Get("X-Conversation-ID")
+	if !uuidV7Pattern.MatchString(v) {
+		t.Errorf("X-Conversation-ID = %q, want UUIDv7", v)
+	}
 	hex32 := regexp.MustCompile(`^[0-9a-f]{32}$`)
-	for _, h := range []string{
-		"X-Conversation-ID",
-		"X-Conversation-Request-ID",
-		"X-Conversation-Message-ID",
-	} {
-		v := req.Header.Get(h)
-		if v == "" {
-			t.Fatalf("%s missing (通道校验会拒绝缺少会话三元组的请求)", h)
+	for _, h := range []string{"X-Conversation-Request-ID", "X-Conversation-Message-ID", "X-Request-ID", "X-Trace-ID"} {
+		hv := req.Header.Get(h)
+		if !hex32.MatchString(hv) {
+			t.Errorf("%s = %q, want 32 hex", h, hv)
 		}
-		if !hex32.MatchString(v) {
-			t.Errorf("%s = %q, want 32 hex", h, v)
+	}
+	if req.Header.Get("X-Trace-ID") == req.Header.Get("X-Conversation-Request-ID") {
+		t.Errorf("X-Trace-ID should be independent from X-Conversation-Request-ID")
+	}
+	if req.Header.Get("b3") == "" || req.Header.Get("traceparent") == "" {
+		t.Errorf("missing b3=%q or traceparent=%q", req.Header.Get("b3"), req.Header.Get("traceparent"))
+	}
+	for _, h := range []string{"Origin", "Referer", "Accept-Language", "X-Machine-ID", "X-Session-ID", "X-No-Enterprise-Id", "X-No-Department-Info"} {
+		if got := req.Header.Get(h); got != "" {
+			t.Errorf("ChatHeaders must not send %s=%q", h, got)
 		}
 	}
 
-	// 兜底会话 ID 每次请求新生成（不是常量），且与 request/message ID 不冲突。
+	// CacheKeyID 稳定生成 UUIDv7，无 CacheKeyID 且无 ConversationID 时每次独立。
 	req2, _ := http.NewRequest(http.MethodPost, "https://example.com/v2/chat/completions", nil)
 	c.ChatHeaders(req2, testAuth(), "", ChatMeta{})
 	if req.Header.Get("X-Conversation-ID") == req2.Header.Get("X-Conversation-ID") {
 		t.Error("fallback X-Conversation-ID should be fresh per request")
+	}
+	reqSticky1, _ := http.NewRequest(http.MethodPost, "https://example.com/v2/chat/completions", nil)
+	reqSticky2, _ := http.NewRequest(http.MethodPost, "https://example.com/v2/chat/completions", nil)
+	c.ChatHeaders(reqSticky1, testAuth(), "", ChatMeta{CacheKeyID: "derived:sticky-1"})
+	c.ChatHeaders(reqSticky2, testAuth(), "", ChatMeta{CacheKeyID: "derived:sticky-1"})
+	if cid := reqSticky1.Header.Get("X-Conversation-ID"); !uuidV7Pattern.MatchString(cid) || cid != reqSticky2.Header.Get("X-Conversation-ID") {
+		t.Errorf("CacheKeyID fallback must derive stable UUIDv7, got %q vs %q", cid, reqSticky2.Header.Get("X-Conversation-ID"))
 	}
 }
 
@@ -59,7 +72,7 @@ func testAuth() *auth.Auth {
 	return &auth.Auth{UID: "u1", AccessToken: "at"}
 }
 
-// TestBillingHeadersBareDomainAndStableIDs 验证 BillingHeaders 剥离 a.Domain 的协议头并注入 36 hex 的 X-Machine-ID / X-Session-ID。
+// TestBillingHeadersBareDomainAndStableIDs 验证 BillingHeaders 剥离 a.Domain 的协议头、不发 HTTP X-Machine-ID/X-Session-ID，并注入 X-Client-* 身份头与环境变量逃生开关。
 func TestBillingHeadersBareDomainAndStableIDs(t *testing.T) {
 	c := &Client{}
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/v2/report", nil)
@@ -72,15 +85,37 @@ func TestBillingHeadersBareDomainAndStableIDs(t *testing.T) {
 	if got := req.Header.Get("X-Domain"); got != "copilot.tencent.com" {
 		t.Errorf("X-Domain = %q, want copilot.tencent.com", got)
 	}
-	hex36 := regexp.MustCompile(`^[0-9a-f]{36}$`)
-	for _, h := range []string{"X-Machine-ID", "X-Session-ID"} {
-		v := req.Header.Get(h)
-		if !hex36.MatchString(v) {
-			t.Errorf("%s = %q, want 36-char hex", h, v)
+	for _, h := range []string{"X-Machine-ID", "X-Session-ID", "X-CodeBuddy-Request", "Accept-Language"} {
+		if got := req.Header.Get(h); got != "" {
+			t.Errorf("BillingHeaders must not send %s=%q", h, got)
 		}
 	}
-	if req.Header.Get("X-Machine-ID") == req.Header.Get("X-Session-ID") {
-		t.Error("X-Machine-ID and X-Session-ID should differ")
+	if req.Header.Get("X-Client-Version") != defaultClientVersion ||
+		req.Header.Get("X-Client-Platform") != "windows" ||
+		req.Header.Get("X-Client-Product") != "WorkBuddy" {
+		t.Errorf("CN X-Client-* mismatch: ver=%q plat=%q prod=%q",
+			req.Header.Get("X-Client-Version"), req.Header.Get("X-Client-Platform"), req.Header.Get("X-Client-Product"))
+	}
+
+	// Global 账号带 Global 版本与 workbuddy-ai 产品段
+	reqGL, _ := http.NewRequest(http.MethodPost, "https://www.workbuddy.ai/v2/report", nil)
+	gl := &auth.Auth{UID: "u-gl", AccessToken: "at", Domain: "www.workbuddy.ai"}
+	c.BillingHeaders(reqGL, gl)
+	if reqGL.Header.Get("X-Client-Version") != defaultClientVersionGlobal ||
+		reqGL.Header.Get("X-Client-Platform") != "windows" ||
+		reqGL.Header.Get("X-Client-Product") != "workbuddy-ai" {
+		t.Errorf("Global X-Client-* mismatch: ver=%q plat=%q prod=%q",
+			reqGL.Header.Get("X-Client-Version"), reqGL.Header.Get("X-Client-Platform"), reqGL.Header.Get("X-Client-Product"))
+	}
+
+	// WB2A_NO_CLIENT_IDENTITY=1 关闭三头注入
+	t.Setenv("WB2A_NO_CLIENT_IDENTITY", "1")
+	reqOff, _ := http.NewRequest(http.MethodPost, "https://example.com/v2/report", nil)
+	c.BillingHeaders(reqOff, a)
+	for _, h := range []string{"X-Client-Version", "X-Client-Platform", "X-Client-Product"} {
+		if got := reqOff.Header.Get(h); got != "" {
+			t.Errorf("%s=%q should be suppressed when WB2A_NO_CLIENT_IDENTITY=1", h, got)
+		}
 	}
 }
 

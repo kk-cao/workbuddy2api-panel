@@ -66,11 +66,16 @@ func TestReportChatActivitySendsArrayWithUserID(t *testing.T) {
 	if ev["commit"] == "" || ev["commit"] == nil {
 		t.Errorf("commit=%v want non-empty", ev["commit"])
 	}
-	if gotHdr.Get("X-Machine-ID") != wantMachine {
-		t.Errorf("X-Machine-ID=%q want %s", gotHdr.Get("X-Machine-ID"), wantMachine)
+	if gotHdr.Get("X-Machine-ID") != "" || gotHdr.Get("X-Session-ID") != "" {
+		t.Errorf("X-Machine-ID/X-Session-ID headers must be empty, got %q / %q",
+			gotHdr.Get("X-Machine-ID"), gotHdr.Get("X-Session-ID"))
 	}
-	if gotHdr.Get("X-Session-ID") != wantSession {
-		t.Errorf("X-Session-ID=%q want %s", gotHdr.Get("X-Session-ID"), wantSession)
+	if gotHdr.Get("User-Agent") != "axios/1.16.1" {
+		t.Errorf("User-Agent=%q want axios/1.16.1", gotHdr.Get("User-Agent"))
+	}
+	if gotHdr.Get("X-Client-Version") != defaultClientVersion || gotHdr.Get("X-Client-Product") != "WorkBuddy" {
+		t.Errorf("unexpected X-Client-* headers: ver=%q prod=%q",
+			gotHdr.Get("X-Client-Version"), gotHdr.Get("X-Client-Product"))
 	}
 	// 出站 body 必须是数组（以 [ 开头），不是单个对象。
 }
