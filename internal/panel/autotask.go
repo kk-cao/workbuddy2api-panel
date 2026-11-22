@@ -825,7 +825,7 @@ func runModelChat(p *Panel, a *auth.Auth) (string, error) {
 		},
 		"stream": true,
 	})
-	rc, status, respBody, err := p.cfg.Upstream.ChatStream(a, body, "", upstream.ChatMeta{})
+	rc, status, respBody, err := p.cfg.Upstream.ChatStream(a, body, "", upstream.ChatMeta{AgentType: upstream.AgentTypeAuxiliary})
 	if err != nil {
 		return "", fmt.Errorf("对话请求: %w", err)
 	}

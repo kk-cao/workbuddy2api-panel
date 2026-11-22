@@ -7,8 +7,38 @@ package upstream
 import (
 	"encoding/json"
 	"log"
+	"math"
+	"regexp"
+	"strconv"
 	"strings"
 )
+
+var reuEscape = regexp.MustCompile(`\\u\{([0-9a-fA-F]{1,6})\}|\\u([0-9a-fA-F]{4})`)
+
+// re2Pattern 把 JS 正则里 RE2 不认的 \uXXXX / \u{XXXX} 译成 \x{...} 并验证能否编译。
+func re2Pattern(p string) (string, bool) {
+	if !strings.Contains(p, `\u`) {
+		return p, true
+	}
+	q := reuEscape.ReplaceAllStringFunc(p, func(m string) string {
+		return `\x{` + strings.Trim(m[2:], "{}") + `}`
+	})
+	if _, err := regexp.Compile(q); err != nil {
+		return "", false
+	}
+	return q, true
+}
+
+// SplitRealmPrefix 解析 "[cn:|global:]model" 路由前缀。
+func SplitRealmPrefix(model string) (realm, bare string) {
+	if i := strings.IndexByte(model, ':'); i >= 0 {
+		switch model[:i] {
+		case "cn", "global":
+			return model[:i], model[i+1:]
+		}
+	}
+	return "cn", model
+}
 
 // PrepareBodyOpt 单 pass 改写；sanitize=false 时行为完全还原（仅强制 stream + 归一化 tool_choice）。
 func PrepareBodyOpt(src []byte, sanitize bool) []byte {
@@ -28,6 +58,11 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 // defaultEfforts（模型声明默认档）补档。defaultEfforts 为 nil 时与旧行为一致
 // （deepseek 缺档回退硬编码 high）。
 func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string) []byte {
+	return PrepareBodyOptWithEffortsDefaultAndCaps(src, sanitize, efforts, defaultEfforts, nil)
+}
+
+// PrepareBodyOptWithEffortsDefaultAndCaps 在 …AndDefault 之上按目录声明 maxOutputTokens 补默认 max_tokens。
+func PrepareBodyOptWithEffortsDefaultAndCaps(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string, maxOut map[string]int64) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -36,54 +71,35 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		return src
 	}
 	obj["stream"] = true
-	// max_completion_tokens → max_tokens 翻译（吸收上游 PR #116，Closes #117）：
-	// OpenAI 规范里 max_tokens 已 deprecated、max_completion_tokens 是新字段；
-	// DeepSeek Harness 等新客户端只发别名。WorkBuddy 上游（CN /v2 与 global
-	// /console 同源）只认 max_tokens——别名透传会被上游忽略后回落默认输出上限
-	// （实测 32000），长流任务被截。
 	translateMaxCompletionTokens(obj)
 	clampGPTMinMaxTokens(obj)
-	// stream_options 仅当 body 未显式带时补 {include_usage: true}（D7）：
-	// 官方 CLI 流式必发该字段，上游据此在末帧返回 usage 用量；显式带则不覆盖。
+	injectCatalogMaxTokens(obj, maxOut)
 	if _, has := obj["stream_options"]; !has {
 		obj["stream_options"] = map[string]any{"include_usage": true}
 	}
 	normalizeToolChoice(obj)
+	normalizeStop(obj)
 	normalizeToolPatterns(obj)
 	normalizeRoles(obj)
 	normalizeImageURL(obj)
 	dropReasoningContentParts(obj)
-	// tool 配对三步（见 tool_pairing.go）：先合并再重排再清理。所有模型一律执行（独立于
-	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
-	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除；
-	// 插在结果中间的非 tool 消息（Codex image_resize_notice）同样判配对断裂，
-	// 先 repack 挪后，再 cleanup 删孤儿，两侧同口径。
-	//
-	// 顺序不能换：mergeAdjacentToolCalls 必须最先跑——它把「背靠背的两条
-	// assistant.tool_calls」合成一条（部分 agent 客户端回放并行调用的报文形状），是上游
-	// deepseek 系模型 11148 的正面修复；先合并再 repack，repack 才看得到完整的一批调用。
 	if msgs, ok := obj["messages"].([]any); ok {
 		msgs, _ = mergeAdjacentToolCalls(msgs)
+		msgs, _ = reorderEarlyToolResults(msgs)
 		msgs, _ = repackToolResultBlocks(msgs)
 		msgs, _ = cleanupOrphanToolCalls(msgs)
-		// 无改动时两步都返回原 slice，这里回写等于零操作；任一步重排/删除
-		// （哪怕后续步骤零改动）也必须落到 obj——不能只在「最后一步改动」时回写，
-		// 否则 repack 单独生效的结果会被原 slice 覆盖丢失。
 		obj["messages"] = msgs
 	}
-	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
-	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
-	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。
 	modelName, _ := obj["model"].(string)
 	injectThinking(obj, lookupDefaultEffort(defaultEfforts, modelName))
 	normalizeReasoningEffort(obj, efforts)
-	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
-	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。
 	backfillReasoningContent(obj)
+	mirrorUpstreamReasoning(obj)
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
 			sanitizeMessages(msgs)
 		}
+		sanitizeTools(obj["tools"])
 	}
 	if msgs, ok := obj["messages"].([]any); ok {
 		guardEmptyTextParts(msgs)
@@ -158,6 +174,34 @@ func clampGPTMinMaxTokens(obj map[string]any) {
 		obj["max_tokens"] = int64(gptMinMaxTokens)
 		log.Printf("max_tokens clamped model=%s %d -> %d", model, v, gptMinMaxTokens)
 	}
+}
+
+// injectCatalogMaxTokens 无显式输出限额时按目录 maxOutputTokens 补 max_tokens。
+func injectCatalogMaxTokens(obj map[string]any, maxOut map[string]int64) {
+	if len(maxOut) == 0 {
+		return
+	}
+	if _, has := obj["max_tokens"]; has {
+		return
+	}
+	model, _ := obj["model"].(string)
+	if v, ok := maxOut[model]; ok && v > 0 {
+		obj["max_tokens"] = v
+		return
+	}
+	_, bare := SplitRealmPrefix(model)
+	if v, ok := maxOut[bare]; ok && v > 0 {
+		obj["max_tokens"] = v
+	}
+}
+
+// normalizeStop 把字符串形态 stop 转为单元素 []string（不 TrimSpace）。
+func normalizeStop(obj map[string]any) {
+	s, ok := obj["stop"].(string)
+	if !ok {
+		return
+	}
+	obj["stop"] = []string{s}
 }
 
 // effortRank 档位从低到高。
@@ -452,22 +496,277 @@ func normalizeToolPatterns(obj map[string]any) {
 		if !ok {
 			continue
 		}
-		// OpenAI 形态 tools[].function.parameters；裸 tools[].parameters 兼容。
 		if fn, ok := tool["function"].(map[string]any); ok {
-			unescapePatternLiteralEscapes(fn["parameters"])
+			fn["parameters"] = normalizeToolParameters(fn["parameters"])
 		}
-		unescapePatternLiteralEscapes(tool["parameters"])
+		if _, ok := tool["parameters"]; ok {
+			tool["parameters"] = normalizeToolParameters(tool["parameters"])
+		}
 	}
 }
 
-// unescapePatternLiteralEscapes 递归改写 schema 树里 pattern 值与 patternProperties
-// 键中的 `\_` → `_`（patternProperties 的键也是正则；map 键不可原地改，命中时重建
-// 该层）。
-func unescapePatternLiteralEscapes(node any) {
+// normalizeToolParameters 归一化工具顶层参数定义并递归规整深层 JSON Schema 树，防 11129 拒收。
+func normalizeToolParameters(node any) any {
+	if node == nil {
+		return map[string]any{"type": "object", "properties": map[string]any{}}
+	}
+	params, ok := node.(map[string]any)
+	if !ok {
+		return map[string]any{"type": "object", "properties": map[string]any{}}
+	}
+	if ref, ok := params["$ref"].(string); ok {
+		delete(params, "$ref")
+		if defs, ok := params["$defs"].(map[string]any); ok && strings.HasPrefix(ref, "#/$defs/") {
+			if t, ok := resolveTopSchemaRef(map[string]any{"$ref": ref}, defs, 0, map[string]bool{}).(map[string]any); ok {
+				for k, v := range t {
+					if _, dup := params[k]; !dup {
+						params[k] = v
+					}
+				}
+			}
+		}
+	}
+	t, ok := params["type"].(string)
+	if !ok || strings.TrimSpace(t) == "" {
+		params["type"] = "object"
+	} else {
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "str":
+			params["type"] = "string"
+		case "int":
+			params["type"] = "integer"
+		case "float":
+			params["type"] = "number"
+		case "bool":
+			params["type"] = "boolean"
+		case "dict":
+			params["type"] = "object"
+		case "list":
+			params["type"] = "array"
+		}
+	}
+	if params["type"] == "object" {
+		if _, hasProps := params["properties"].(map[string]any); !hasProps {
+			params["properties"] = map[string]any{}
+		}
+	}
+	normalizeSchemaTree(params)
+	return params
+}
+
+func resolveTopSchemaRef(v any, defs map[string]any, depth int, visited map[string]bool) any {
+	if depth > 16 {
+		return nil
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return v
+	}
+	ref, hasRef := m["$ref"].(string)
+	if !hasRef || !strings.HasPrefix(ref, "#/$defs/") {
+		return m
+	}
+	name := strings.TrimPrefix(ref, "#/$defs/")
+	if visited[name] {
+		return nil
+	}
+	target, ok := defs[name]
+	if !ok {
+		return nil
+	}
+	nextVisited := make(map[string]bool, len(visited)+1)
+	for k, val := range visited {
+		nextVisited[k] = val
+	}
+	nextVisited[name] = true
+	return resolveTopSchemaRef(target, defs, depth+1, nextVisited)
+}
+
+var schemaContainerKeys = map[string]bool{
+	"properties":        true,
+	"patternProperties": true,
+	"$defs":             true,
+	"definitions":       true,
+	"dependentSchemas":  true,
+	"dependentRequired": true,
+	"dependencies":      true,
+}
+
+var schemaDataKeys = map[string]bool{
+	"default":  true,
+	"const":    true,
+	"enum":     true,
+	"example":  true,
+	"examples": true,
+}
+
+var (
+	schemaNumberKeys = []string{
+		"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+		"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties",
+	}
+	schemaBoolKeys   = []string{"uniqueItems", "deprecated", "readOnly", "writeOnly"}
+	schemaStringKeys = []string{"description", "title", "format", "pattern"}
+)
+
+func coerceSchemaKeywords(n map[string]any) {
+	for _, k := range schemaNumberKeys {
+		if v, ok := n[k]; ok {
+			if num, ok := schemaNumber(v); ok {
+				n[k] = num
+			} else {
+				delete(n, k)
+			}
+		}
+	}
+	for _, k := range schemaBoolKeys {
+		if v, ok := n[k]; ok {
+			if b, ok := schemaBool(v); ok {
+				n[k] = b
+			} else {
+				delete(n, k)
+			}
+		}
+	}
+	for _, k := range schemaStringKeys {
+		if v, ok := n[k]; ok {
+			if _, isStr := v.(string); !isStr {
+				delete(n, k)
+			}
+		}
+	}
+	if v, ok := n["additionalProperties"]; ok {
+		if _, isSchema := v.(map[string]any); !isSchema {
+			if b, ok := schemaBool(v); ok {
+				n["additionalProperties"] = b
+			} else {
+				delete(n, "additionalProperties")
+			}
+		}
+	}
+	for _, k := range []string{"enum", "examples"} {
+		if v, ok := n[k]; ok {
+			if _, isList := v.([]any); !isList {
+				delete(n, k)
+			}
+		}
+	}
+}
+
+func schemaNumber(v any) (any, bool) {
+	switch x := v.(type) {
+	case float64:
+		if math.IsNaN(x) || math.IsInf(x, 0) {
+			return nil, false
+		}
+		return x, true
+	case int:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil, false
+		}
+		return f, true
+	}
+	return nil, false
+}
+
+func schemaBool(v any) (bool, bool) {
+	switch x := v.(type) {
+	case bool:
+		return x, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(x)) {
+		case "true":
+			return true, true
+		case "false":
+			return false, true
+		}
+	}
+	return false, false
+}
+
+func normalizeSchemaTree(node any) {
 	switch n := node.(type) {
 	case map[string]any:
-		if p, ok := n["pattern"].(string); ok && strings.Contains(p, `\_`) {
-			n["pattern"] = strings.ReplaceAll(p, `\_`, `_`)
+		coerceSchemaKeywords(n)
+		for k, v := range n {
+			if v == nil && !schemaDataKeys[k] {
+				delete(n, k)
+			}
+		}
+		if t, ok := n["type"].(string); ok {
+			switch strings.ToLower(strings.TrimSpace(t)) {
+			case "str":
+				n["type"] = "string"
+			case "int":
+				n["type"] = "integer"
+			case "float":
+				n["type"] = "number"
+			case "bool":
+				n["type"] = "boolean"
+			case "dict":
+				n["type"] = "object"
+			case "list":
+				n["type"] = "array"
+			case "":
+				if _, hasProps := n["properties"]; hasProps {
+					n["type"] = "object"
+				}
+			}
+		}
+		if req, hasReq := n["required"]; hasReq {
+			if reqList, ok := req.([]any); ok {
+				var cleaned []any
+				seen := make(map[string]bool, len(reqList))
+				for _, item := range reqList {
+					if s, ok := item.(string); ok {
+						s = strings.TrimSpace(s)
+						if s != "" && !seen[s] {
+							seen[s] = true
+							cleaned = append(cleaned, s)
+						}
+					}
+				}
+				if len(cleaned) == 0 {
+					delete(n, "required")
+				} else {
+					n["required"] = cleaned
+				}
+			} else {
+				delete(n, "required")
+			}
+		}
+		if items, hasItems := n["items"]; hasItems {
+			if items == nil {
+				delete(n, "items")
+			} else if itemList, ok := items.([]any); ok {
+				var firstDict map[string]any
+				for _, it := range itemList {
+					if d, ok := it.(map[string]any); ok {
+						firstDict = d
+						break
+					}
+				}
+				if firstDict != nil {
+					n["items"] = firstDict
+				} else {
+					n["items"] = map[string]any{"type": "string"}
+				}
+			}
+		}
+		if p, ok := n["pattern"].(string); ok {
+			if strings.Contains(p, `\_`) {
+				p = strings.ReplaceAll(p, `\_`, `_`)
+			}
+			if fixed, compiled := re2Pattern(p); compiled {
+				n["pattern"] = fixed
+			} else {
+				delete(n, "pattern")
+			}
 		}
 		if props, ok := n["patternProperties"].(map[string]any); ok {
 			rebuilt := false
@@ -483,12 +782,65 @@ func unescapePatternLiteralEscapes(node any) {
 				n["patternProperties"] = fixed
 			}
 		}
-		for _, v := range n {
-			unescapePatternLiteralEscapes(v)
+		if _, hasType := n["type"]; !hasType {
+			if e, ok := n["enum"].([]any); ok && len(e) > 0 {
+				if t := inferEnumType(e); t != "" {
+					n["type"] = t
+				}
+			}
+		}
+		for k, v := range n {
+			if schemaDataKeys[k] {
+				continue
+			}
+			if schemaContainerKeys[k] {
+				if c, ok := v.(map[string]any); ok {
+					for childKey, child := range c {
+						if child == nil {
+							delete(c, childKey)
+							continue
+						}
+						normalizeSchemaTree(child)
+					}
+				}
+				continue
+			}
+			normalizeSchemaTree(v)
 		}
 	case []any:
 		for _, v := range n {
-			unescapePatternLiteralEscapes(v)
+			normalizeSchemaTree(v)
 		}
 	}
+}
+
+func inferEnumType(values []any) string {
+	var strs, nums, ints, bools int
+	for _, v := range values {
+		switch x := v.(type) {
+		case string:
+			strs++
+		case bool:
+			bools++
+		case float64:
+			nums++
+			if x == math.Trunc(x) {
+				ints++
+			}
+		default:
+			return ""
+		}
+	}
+	n := len(values)
+	switch {
+	case strs == n:
+		return "string"
+	case bools == n:
+		return "boolean"
+	case nums == n && ints == n:
+		return "integer"
+	case nums == n:
+		return "number"
+	}
+	return ""
 }

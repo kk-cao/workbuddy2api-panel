@@ -77,6 +77,10 @@ type Scheduler struct {
 	mu         sync.Mutex
 	adoptTried map[string]string
 
+	// authHealMu/authHealAt 401→refresh 求证成功后的退避记账（uid → 上次求证成功时刻）。
+	authHealMu sync.Mutex
+	authHealAt map[string]time.Time
+
 	// schedMu 保护排程参数（时点/开关）；Reconfigure 可在运行期热改（面板保存配置时调用）。
 	// rearmSchedule/rearmBalance/rearmSweep 是「排程已变，立即重算」通知：Run 与
 	// 各周期循环各自消费，分别用独立 channel（同 channel 被多个 select 消费会丢信号）。
@@ -474,17 +478,11 @@ func (s *Scheduler) RunCheckinNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
-		// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
-		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
-		// 按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
+		// global realm：先只读查询签到活动状态，仅 active 且当天未签时才发写请求；
+		// 末尾不 continue，与企业版同口径继续走下方余额快照更新与自动解冻闭环。
 		if a.IsGlobal() {
-			continue
-		}
-		// 企业版无签到体系：上游对 POST /v2/billing/meter/daily-checkin 直接
-		// 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 continue**——
-		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
-		// credit_floor 判定与面板额度展示的唯一数据源）。
-		if !a.IsEnterprise() {
+			s.checkinGlobal(a)
+		} else if !a.IsEnterprise() {
 			if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 				// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
 				if upstream.IsAlreadyCheckin(err) {
@@ -654,6 +652,10 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 	var wg sync.WaitGroup
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
+	var staggerWin time.Duration
+	if cur := time.Duration(s.balanceInterval.Load()); cur >= 5*time.Second {
+		staggerWin = min(spreadIntervalStagger(cur, 0.15), 30*time.Second)
+	}
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
@@ -662,12 +664,17 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		if a == nil {
 			continue
 		}
+		delay := spreadStaggerDelay(staggerWin, st.UID)
 		wg.Add(1)
-		go func(a *auth.Auth, uid string) {
+		go func(a *auth.Auth, uid string, delay time.Duration) {
 			defer wg.Done()
+			if delay > 0 {
+				time.Sleep(delay)
+			}
 			remain, total, expiring, earliestAt, earliestRemaining, buckets, err := s.cfg.Upstream.UserResourceSnapshot(a, expiringSoon)
 			if err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
+				s.noteBalanceAuthFailure(a, uid, err)
 				return
 			}
 			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
@@ -679,7 +686,7 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 				EarliestRemaining: earliestRemaining,
 				ExpiryBuckets:     poolExpiryBuckets(buckets),
 			})
-			}(a, st.UID)
+		}(a, st.UID, delay)
 	}
 	wg.Wait()
 	s.lastBalanceRefresh.Store(time.Now().UnixNano())
@@ -715,7 +722,11 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 					continue
 				}
 			}
-			timer := time.NewTimer(cur)
+			wait := cur
+			if cur >= 5*time.Second {
+				wait += periodicJitter(cur, 0.15, "balance_refresh")
+			}
+			timer := time.NewTimer(wait)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
@@ -758,7 +769,11 @@ func (s *Scheduler) StartTaskSweep(ctx context.Context, interval time.Duration) 
 					continue
 				}
 			}
-			timer := time.NewTimer(cur)
+			wait := cur
+			if cur >= 5*time.Second {
+				wait += periodicJitter(cur, 0.15, "task_sweep")
+			}
+			timer := time.NewTimer(wait)
 			select {
 			case <-ctx.Done():
 				timer.Stop()

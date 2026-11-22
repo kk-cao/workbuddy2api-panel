@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"net/http"
 	"time"
 )
 
@@ -40,17 +39,11 @@ func NewDNSDialer(servers []string) *net.Dialer {
 	return d
 }
 
-// SetDNSDialer 把拨号器换到已有的两个 http.Client 上（只覆盖 Transport.DialContext）。
+// SetDNSDialer 把拨号器换到已有的两个 http.Client 上（同时更新 DialContext 与 DialTLSContext）。
 func (c *Client) SetDNSDialer(d *net.Dialer) {
 	if d == nil {
 		return
 	}
-	for _, cl := range []*http.Client{c.HTTP, c.ChatHTTP} {
-		if cl == nil {
-			continue
-		}
-		if t, ok := cl.Transport.(*http.Transport); ok {
-			t.DialContext = d.DialContext
-		}
-	}
+	c.dialer = d
+	c.rebuildTLSDialer()
 }

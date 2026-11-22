@@ -1,8 +1,13 @@
 package upstream
 
 import (
+	"compress/gzip"
+	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -119,3 +124,106 @@ func TestBillingHeadersBareDomainAndStableIDs(t *testing.T) {
 	}
 }
 
+
+func TestChatHeadersPhase2SDKAndIdentity(t *testing.T) {
+	c := New()
+
+	// 1. Personal account: 46+ headers present, X-Auth-Method / X-Userinfo omitted
+	reqPers, _ := http.NewRequest(http.MethodPost, "https://copilot.tencent.com/v2/chat/completions", nil)
+	pers := &auth.Auth{UID: "u-pers", AccessToken: "at"}
+	c.ChatHeaders(reqPers, pers, "", ChatMeta{RootRequestID: "root-1"})
+	for _, k := range []string{
+		"X-Stainless-Lang", "X-Stainless-Package-Version", "X-Stainless-OS",
+		"X-Stainless-Arch", "X-Stainless-Runtime", "X-Stainless-Runtime-Version",
+		"X-Stainless-Retry-Count", "X-Agent-Intent", "X-Agent-Type", "X-Agent-Runtime",
+		"acp-connection-id", "baggage", "X-Root-Request-ID",
+	} {
+		if reqPers.Header.Get(k) == "" {
+			t.Errorf("personal ChatHeaders missing %s", k)
+		}
+	}
+	if reqPers.Header.Get("X-Agent-Type") != AgentTypeMain {
+		t.Errorf("default X-Agent-Type=%q want %q", reqPers.Header.Get("X-Agent-Type"), AgentTypeMain)
+	}
+	if reqPers.Header.Get("X-Agent-Runtime") != "local-agent" {
+		t.Errorf("X-Agent-Runtime=%q want local-agent", reqPers.Header.Get("X-Agent-Runtime"))
+	}
+	if reqPers.Header.Get("X-Root-Request-ID") != "root-1" {
+		t.Errorf("X-Root-Request-ID=%q want root-1", reqPers.Header.Get("X-Root-Request-ID"))
+	}
+	if reqPers.Header.Get("X-Auth-Method") != "" || reqPers.Header.Get("X-Userinfo") != "" {
+		t.Errorf("personal account should omit X-Auth-Method/X-Userinfo, got method=%q info=%q",
+			reqPers.Header.Get("X-Auth-Method"), reqPers.Header.Get("X-Userinfo"))
+	}
+
+	// 2. Enterprise + auxiliary agentType
+	reqEnt, _ := http.NewRequest(http.MethodPost, "https://copilot.tencent.com/v2/chat/completions", nil)
+	ent := &auth.Auth{UID: "u-ent", AccessToken: "at", EnterpriseID: "ent-1"}
+	c.ChatHeaders(reqEnt, ent, "", ChatMeta{AgentType: AgentTypeAuxiliary})
+	if reqEnt.Header.Get("X-Agent-Type") != AgentTypeAuxiliary {
+		t.Errorf("auxiliary X-Agent-Type=%q want %q", reqEnt.Header.Get("X-Agent-Type"), AgentTypeAuxiliary)
+	}
+	if reqEnt.Header.Get("X-Userinfo") == "" {
+		t.Errorf("enterprise account should inject X-Userinfo")
+	}
+
+	// 3. RefreshHeaders carries X-Requested-With: XMLHttpRequest
+	reqRef, _ := http.NewRequest(http.MethodPost, "https://copilot.tencent.com/v2/plugin/auth/refresh", nil)
+	c.RefreshHeaders(reqRef, pers)
+	if got := reqRef.Header.Get("X-Requested-With"); got != "XMLHttpRequest" {
+		t.Errorf("RefreshHeaders X-Requested-With=%q want XMLHttpRequest", got)
+	}
+}
+
+func TestChatStreamGzipThresholdAndOptOut(t *testing.T) {
+	var gotEnc string
+	var gotPlain []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotEnc = r.Header.Get("Content-Encoding")
+		if gotEnc == "gzip" {
+			gz, err := gzip.NewReader(r.Body)
+			if err != nil {
+				t.Errorf("gzip.NewReader: %v", err)
+				return
+			}
+			defer gz.Close()
+			gotPlain, _ = io.ReadAll(gz)
+		} else {
+			gotPlain, _ = io.ReadAll(r.Body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer ts.Close()
+
+	c := New()
+	c.ChatBaseCN = ts.URL
+	acct := &auth.Auth{AccessToken: "at", Domain: "copilot.tencent.com", UID: "u1"}
+	largeText := strings.Repeat("x", 1500)
+	body := []byte(`{"model":"glm-5.3-flash","messages":[{"role":"user","content":"` + largeText + `"}]}`)
+
+	rc, status, _, err := c.ChatStreamContext(t.Context(), acct, body, "", ChatMeta{})
+	if err != nil || status != 200 {
+		t.Fatalf("large chat failed: status=%d err=%v", status, err)
+	}
+	rc.Close()
+	if gotEnc != "gzip" {
+		t.Errorf(">=1024B body Content-Encoding=%q want gzip", gotEnc)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(gotPlain, &obj); err != nil {
+		t.Fatalf("decompressed body not valid JSON: %v", err)
+	}
+
+	// Opt-out via WB2A_NO_CHAT_GZIP=1
+	t.Setenv("WB2A_NO_CHAT_GZIP", "1")
+	gotEnc = ""
+	rc2, status2, _, err2 := c.ChatStreamContext(t.Context(), acct, body, "", ChatMeta{})
+	if err2 != nil || status2 != 200 {
+		t.Fatalf("opt-out chat failed: status=%d err=%v", status2, err2)
+	}
+	rc2.Close()
+	if gotEnc != "" {
+		t.Errorf("WB2A_NO_CHAT_GZIP=1 expected empty Content-Encoding, got %q", gotEnc)
+	}
+}

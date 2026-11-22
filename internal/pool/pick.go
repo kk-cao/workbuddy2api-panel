@@ -54,7 +54,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	// floorBlocked 积分保底拦截判定（实现在 floorBlockedForRealmModel，与粘性路径共用）：
 	// 触底 + 收费（本地实测台账 或 上游目录倍率）即拦；免费/未知倍率不受限。
 	floorBlocked := func(e *entry) bool { return p.floorBlockedForRealmModel(e, reqModel, realm, now) }
-	var cands []*entry
+	var cands, exclusiveHeld []*entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
 			continue
@@ -72,7 +72,15 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		if p.inFlightFull(e) {
 			continue // 在途占满：跳过（max=0 不限时不触发）
 		}
+		if p.exclusiveBlockedForRealmModel(e, reqModel, realm) {
+			exclusiveHeld = append(exclusiveHeld, e)
+			continue // accessMode=exclusive 且已知免费：有付费号/未知号时优先跳过
+		}
 		cands = append(cands, e)
+	}
+	if len(cands) == 0 && len(exclusiveHeld) > 0 {
+		// 池内只剩已知免费号：兜底放行，不能在有健康免费号时提前报无号可用或去捞冷却号。
+		cands = exclusiveHeld
 	}
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
@@ -301,6 +309,22 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 		return false // 倍率非数值（异常形态）：不据此惩罚账号
 	}
 	return v > 0
+}
+
+// exclusiveBlockedForRealmModel 报告账号是否因「exclusive 模型且已知为免费号」而应避让。
+// 付费状态未知（known=false）时放行，避免缺数据误排可用号。
+func (p *Pool) exclusiveBlockedForRealmModel(e *entry, model, realm string) bool {
+	if p.exclusiveModelOf == nil || p.exclusivePaidOf == nil || model == "" {
+		return false
+	}
+	if realm == "" {
+		realm = e.a.Realm()
+	}
+	if !p.exclusiveModelOf(realm, model) {
+		return false
+	}
+	paid, known := p.exclusivePaidOf(e.a.UID)
+	return known && !paid
 }
 
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。

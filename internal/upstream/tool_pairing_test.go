@@ -513,3 +513,34 @@ func TestCleanupOrphanToolCallsEmptyName(t *testing.T) {
 		assertSummary(t, summarize(out), []string{"assistant(c1,c2)", "tool(c1)", "tool(c2)"})
 	})
 }
+
+func TestReorderEarlyToolResults(t *testing.T) {
+	t.Run("早到结果挪到所属调用之后", func(t *testing.T) {
+		in := msgs(t, `[
+			{"role":"tool","tool_call_id":"c0","content":"res0"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c0","type":"function","function":{"name":"f","arguments":"{}"}}]}
+		]`)
+		out, changed := reorderEarlyToolResults(in)
+		if !changed {
+			t.Fatal("changed=false, want true")
+		}
+		assertSummary(t, summarize(out), []string{"assistant(c0)", "tool(c0)"})
+	})
+
+	t.Run("跨轮复用 call_0 不误吸第一轮正常结果", func(t *testing.T) {
+		in := msgs(t, `[
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_0","type":"function","function":{"name":"f","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_0","content":"r1"},
+			{"role":"tool","tool_call_id":"call_0","content":"r2-early"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_0","type":"function","function":{"name":"f","arguments":"{}"}}]}
+		]`)
+		out, changed := reorderEarlyToolResults(in)
+		if !changed {
+			t.Fatal("changed=false, want true")
+		}
+		assertSummary(t, summarize(out), []string{"assistant(call_0)", "tool(call_0)", "assistant(call_0)", "tool(call_0)"})
+		if out[1].(map[string]any)["content"] != "r1" || out[3].(map[string]any)["content"] != "r2-early" {
+			t.Errorf("cross-round call_0 content misordered: %+v", out)
+		}
+	})
+}

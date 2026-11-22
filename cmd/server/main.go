@@ -141,6 +141,7 @@ func main() {
 	// （kimi-k3-1 实案：全池无观测 → 保底全放行 → 两笔打穿并硬冷却到次日 04:00）。
 	// 位于 up 装配之后：倍率表由探测下发，闭包每次调用读实时快照。
 	p.SetModelRateOf(func(realm, model string) string { return up.ModelRate(realm, model) })
+	p.SetExclusiveModels(up.ModelExclusive, up.PaidUser)
 
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
@@ -166,6 +167,9 @@ func main() {
 	up.DeviceToken = cfg.Upstream.DeviceToken
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
+	if err := up.SetTLSFingerprint(cfg.Upstream.TLSFingerprint); err != nil {
+		log.Fatalf("config error: %v", err)
+	}
 	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
 	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
 	up.GlobalEnabled = cfg.Global.Enabled

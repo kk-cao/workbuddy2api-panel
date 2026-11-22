@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -152,8 +153,19 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 				sawDone = true
 				break
 			} else {
-				var chunk map[string]any
-				if json.Unmarshal([]byte(payload), &chunk) == nil {
+				var chunks []map[string]any
+				var whole map[string]any
+				if json.Unmarshal([]byte(payload), &whole) == nil {
+					chunks = []map[string]any{whole}
+				} else {
+					for _, part := range SplitConcatenatedJSON(payload) {
+						var c map[string]any
+						if json.Unmarshal([]byte(part), &c) == nil {
+							chunks = append(chunks, c)
+						}
+					}
+				}
+				for _, chunk := range chunks {
 					// 有效事件计数：仅 JSON 解析成功的数据帧计入（解析失败沿用静默 continue）。
 					validEvents++
 					if v, ok := chunk["id"].(string); ok && id == "" {
@@ -676,9 +688,26 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 
 	// writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
 	// 仅 JSON 解析成功时计数记为一次有效转发（JSON 解析失败照常降级原样写出，但不计数）。
-	writeFrame := func(payload string) (int, error) {
+	var writeFrame func(string) (int, error)
+	writeFrame = func(payload string) (int, error) {
 		var obj map[string]any
 		if json.Unmarshal([]byte(payload), &obj) != nil {
+			if parts := SplitConcatenatedJSON(payload); len(parts) > 1 {
+				log.Printf("WARN: [upstream] data 帧内含 %d 个 JSON 对象（上游粘帧）→ 拆成独立帧透传，首个 %.120q",
+					len(parts), truncate(parts[0], 120))
+				n := 0
+				for _, part := range parts {
+					c, werr := writeFrame(part)
+					if werr != nil {
+						return n, werr
+					}
+					n += c
+				}
+				return n, nil
+			}
+			if looksLikeJSON(payload) {
+				log.Printf("WARN: [upstream] data 帧不是合法 JSON → 原样透传 %.160q", truncate(payload, 160))
+			}
 			// 非 JSON 帧：原样降级写出，不计数（与修复前一致）。
 			if werr := writeSSE(payload); werr != nil {
 				return 0, werr

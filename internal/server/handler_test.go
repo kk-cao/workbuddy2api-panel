@@ -27,6 +27,7 @@ import (
 // 断言表格行输出的测试（logging_test.go 中的 ChatLogs/LogChatRow 系列）用 withChatLog 临时开启。
 func TestMain(m *testing.M) {
 	chatLogEnabled = false
+	egressBackoffBase = 0
 	os.Exit(m.Run())
 }
 

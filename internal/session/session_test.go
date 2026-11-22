@@ -404,3 +404,38 @@ func TestLookupForModelOnlyReusesValidBinding(t *testing.T) {
 		t.Fatal("lookup allocated a replacement")
 	}
 }
+
+func TestDeriveCacheKeyGivesUserIDClientsPerConversationSlots(t *testing.T) {
+	b1 := []byte(`{"metadata":{"user_id":"alice"},"messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}`)
+	b2 := []byte(`{"metadata":{"user_id":"alice"},"messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"next"}]}`)
+	b3 := []byte(`{"metadata":{"user_id":"bob"},"messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}`)
+	b4 := []byte(`{"user":"carol","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}`)
+	bNoUser := []byte(`{"messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}`)
+
+	if ExtractKey(b1) != "" {
+		t.Fatal("ExtractKey with user_id must stay empty")
+	}
+	k1 := DeriveCacheKey(b1)
+	if k1 == "" || !strings.HasPrefix(k1, "d-") {
+		t.Fatalf("DeriveCacheKey failed: %q", k1)
+	}
+	if DeriveCacheKey(b2) != k1 {
+		t.Error("same caller + same opening must share DeriveCacheKey across turns")
+	}
+	if DeriveCacheKey(b3) == k1 || DeriveCacheKey(b4) == k1 || DeriveCacheKey(b4) == DeriveCacheKey(b3) {
+		t.Error("different caller user_id/user must map to distinct cache keys")
+	}
+	if got, want := DeriveCacheKey(bNoUser), ExtractKey(bNoUser); got == "" || got != want {
+		t.Errorf("without user_id DeriveCacheKey=%q must byte-match ExtractKey=%q", got, want)
+	}
+}
+
+func TestRequestIDForKeyStable(t *testing.T) {
+	r1 := RequestIDForKey("root:sess-1")
+	r2 := RequestIDForKey("root:sess-1")
+	r3 := RequestIDForKey("root:sess-2")
+	if len(r1) != 32 || r1 != r2 || r1 == r3 {
+		t.Fatalf("RequestIDForKey unexpected: r1=%q r2=%q r3=%q", r1, r2, r3)
+	}
+}
+

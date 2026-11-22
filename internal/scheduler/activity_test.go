@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -579,14 +580,60 @@ func TestRunActivityNowGlobalErrorDoesNotSkipCN(t *testing.T) {
 	}
 }
 
-// TestCheckinStillSkipsGlobal 回归护栏：本次只放开活跃上报，签到仍跳过 global
-// （上游 a190252 明确「checkin/travel 门控不动」）。误删该 gate 会让国际版去打
-// CN 专属签到端点。
+// TestCheckinStillSkipsGlobal 国际版签到只读先行：默认活动未开启（active=false）时
+// 只发只读 /checkin-activity-status 查询，绝不盲发写请求 daily-checkin。
 func TestCheckinStillSkipsGlobal(t *testing.T) {
 	withGlobalSwitch(t)
-	var hits atomic.Int32
+	var activityHits, claimHits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
+		switch {
+		case strings.Contains(r.URL.Path, "checkin-activity-status"):
+			activityHits.Add(1)
+			w.Write([]byte(`{"code":0,"data":{"active":false,"today_checked_in":false,"daily_credit":100}}`))
+		case strings.Contains(r.URL.Path, "daily-checkin"):
+			claimHits.Add(1)
+			w.Write([]byte(`{"code":0,"data":{}}`))
+		default:
+			w.Write([]byte(`{"code":0,"data":{}}`))
+		}
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(globalAccount(t, "g1"))
+	up := &upstream.Client{
+		HTTP:              srv.Client(),
+		GlobalEnabled:     true,
+		ChatBaseCN:        srv.URL,
+		BillingBaseCN:     srv.URL,
+		ChatBaseGlobal:    srv.URL,
+		BillingBaseGlobal: srv.URL,
+	}
+	s := New(Config{Pool: p, Upstream: up})
+
+	s.RunCheckinNow()
+
+	if n := activityHits.Load(); n != 1 {
+		t.Errorf("checkin-activity-status hits=%d want 1", n)
+	}
+	if n := claimHits.Load(); n != 0 {
+		t.Errorf("daily-checkin hits=%d want 0（活动未开启不发写请求）", n)
+	}
+}
+
+func TestCheckinGlobalActiveClaimsOnce(t *testing.T) {
+	withGlobalSwitch(t)
+	var claimHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "checkin-activity-status") {
+			w.Write([]byte(`{"code":0,"data":{"active":true,"today_checked_in":false,"daily_credit":100}}`))
+			return
+		}
+		if strings.Contains(r.URL.Path, "daily-checkin") {
+			claimHits.Add(1)
+			w.Write([]byte(`{"code":0,"data":{}}`))
+			return
+		}
 		w.Write([]byte(`{"code":0,"data":{}}`))
 	}))
 	defer srv.Close()
@@ -605,7 +652,50 @@ func TestCheckinStillSkipsGlobal(t *testing.T) {
 
 	s.RunCheckinNow()
 
-	if n := hits.Load(); n != 0 {
-		t.Errorf("checkin global 上游调用=%d want 0（签到仍应跳过 global）", n)
+	if n := claimHits.Load(); n != 1 {
+		t.Errorf("daily-checkin hits=%d want 1", n)
+	}
+	if st, ok := p.Status("g1"); !ok || !st.CheckinDone {
+		t.Errorf("global active checkin should mark CheckinDone, st=%+v ok=%v", st, ok)
+	}
+}
+
+func TestCheckinGlobalRefreshesCreditsAndReenables(t *testing.T) {
+	withGlobalSwitch(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "checkin-activity-status"):
+			w.Write([]byte(`{"code":0,"data":{"active":false}}`))
+		case strings.Contains(r.URL.Path, "get-user-resource-summary"):
+			w.Write([]byte(`{"code":0,"data":{"Packages":[{"PackageCode":"p1","CycleTotalCapacity":"300","CycleRemainCapacity":"200"}]}}`))
+		default:
+			w.Write([]byte(`{"code":0,"data":{"Accounts":[]}}`))
+		}
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(globalAccount(t, "g1"))
+	p.Cooldown("g1", pool.CoolHard, time.Hour, "余额不足")
+	if st, _ := p.Status("g1"); !st.Cooling {
+		t.Fatal("expected g1 to start hard-cooled")
+	}
+	up := &upstream.Client{
+		HTTP:              srv.Client(),
+		GlobalEnabled:     true,
+		ChatBaseCN:        srv.URL,
+		BillingBaseCN:     srv.URL,
+		ChatBaseGlobal:    srv.URL,
+		BillingBaseGlobal: srv.URL,
+	}
+	s := New(Config{Pool: p, Upstream: up})
+	s.RunCheckinNow()
+
+	st, _ := p.Status("g1")
+	if st.Cooling {
+		t.Fatalf("global checkin 后拿到剩余 200 积分应自动解冻: %+v", st)
+	}
+	if st.Credits != 200 || st.CreditsTotal != 300 {
+		t.Fatalf("credits=%d total=%d want 200/300", st.Credits, st.CreditsTotal)
 	}
 }

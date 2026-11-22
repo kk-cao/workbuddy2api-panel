@@ -109,6 +109,98 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
 	return out, true
 }
 
+// reorderEarlyToolResults 把「早于其 tool_call」出现的 role:tool 结果移到对应 assistant(tool_calls) 之后。
+// 同 id 跨轮复用时按顺序跟踪「已声明、未应答」次数，避免把早轮次正常结果搬错轮次。
+func reorderEarlyToolResults(messages []any) ([]any, bool) {
+	if len(messages) < 2 {
+		return messages, false
+	}
+	decls := map[string][]int{}
+	for i, raw := range messages {
+		for _, id := range declaredToolCallIDs(raw) {
+			decls[id] = append(decls[id], i)
+		}
+	}
+	if len(decls) == 0 {
+		return messages, false
+	}
+	open := map[string]int{}
+	group := map[int][]any{}
+	early := make([]bool, len(messages))
+	anyEarly := false
+	for i, raw := range messages {
+		for _, id := range declaredToolCallIDs(raw) {
+			open[id]++
+		}
+		m, ok := raw.(map[string]any)
+		if !ok || m["role"] != "tool" {
+			continue
+		}
+		id, _ := m["tool_call_id"].(string)
+		if open[id] > 0 {
+			open[id]--
+			continue
+		}
+		for _, j := range decls[id] {
+			if j > i {
+				early[i] = true
+				anyEarly = true
+				group[j] = append(group[j], raw)
+				open[id]--
+				break
+			}
+		}
+	}
+	if !anyEarly {
+		return messages, false
+	}
+
+	out := make([]any, 0, len(messages))
+	var pending []any
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		out = append(out, pending...)
+		pending = nil
+	}
+	for i, raw := range messages {
+		if early[i] {
+			continue
+		}
+		role := ""
+		if m, ok := raw.(map[string]any); ok {
+			role, _ = m["role"].(string)
+		}
+		if len(pending) > 0 && role != "tool" {
+			flush()
+		}
+		out = append(out, raw)
+		if g, ok := group[i]; ok {
+			pending = g
+		}
+	}
+	flush()
+	return out, true
+}
+
+func declaredToolCallIDs(raw any) []string {
+	m, ok := raw.(map[string]any)
+	if !ok || m["role"] != "assistant" {
+		return nil
+	}
+	tcs, _ := m["tool_calls"].([]any)
+	var ids []string
+	for _, tci := range tcs {
+		if tc, ok := tci.(map[string]any); ok {
+			if id, _ := tc["id"].(string); id != "" {
+				ids = append(ids, id)
+			}
+		}
+	}
+	return ids
+}
+
 // cleanupOrphanToolCalls 剔除无法配对的 tool_call 与 tool 结果（所有模型，独立于
 // deepseek-only 的 sanitize 开关）。语义对齐参考仓库 resolveToolPairing：
 //

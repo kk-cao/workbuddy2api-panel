@@ -7,7 +7,7 @@ let remarksCache = null;
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
-let logPin = true, loginState = null, loginTimer = null;
+let logPin = true, loginState = null, loginTimer = null, loginStartAt = 0;
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
@@ -1306,7 +1306,7 @@ function openAdd() {
   // 重置到登录标签
   switchAddTab('login');
   $('addPick').hidden = false;
-  $('addLoad').hidden = true; $('addReady').hidden = true;
+  $('addLoad').hidden = true; $('addReady').hidden = true; $('addQr').hidden = true; $('addQr').innerHTML = '';
   $('addDone').hidden = true; $('addErr').hidden = true;
   $('importDone').hidden = true; $('importErr').hidden = true;
   $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
@@ -1327,11 +1327,21 @@ function startAddLogin() {
   $('addLoad').hidden = false; $('addErr').hidden = true;
   api('login/start', { method: 'POST', body: JSON.stringify({ realm }) }).then(r => {
     loginState = r.state;
+    loginStartAt = Date.now();
     $('addUrl').textContent = r.url;
+    try {
+      const M = qrMatrix(r.url);
+      $('addQr').innerHTML = qrSVG(M, (M.length + 8) * 4);
+      $('addQr').hidden = false;
+    } catch (e) {
+      $('addQr').innerHTML = '<span class="note">链接过长，无法生成二维码，请用下方「复制链接」或「在浏览器打开」</span>';
+      $('addQr').hidden = false;
+    }
     $('addPick').hidden = true; // 选域锁定（会话已按该域发起）
     $('addLoad').hidden = true; $('addReady').hidden = false;
     $('btnStartLogin').hidden = true;
     $('btnCopyUrl').hidden = false; $('btnOpenUrl').hidden = false;
+    pollFails = 0;
     loginTimer = setInterval(pollLogin, 3000);
   }).catch(e => {
     $('addLoad').hidden = true;
@@ -1341,22 +1351,47 @@ function startAddLogin() {
   });
 }
 function stopPoll() { if (loginTimer) { clearInterval(loginTimer); loginTimer = null; } }
+let pollFails = 0;
+const POLL_MAX_FAILS = 20;
 async function pollLogin() {
   if (!loginState) return;
   try {
     const r = await api('login/poll?state=' + encodeURIComponent(loginState));
+    pollFails = 0;
+    if (r.fatal) {
+      stopPoll();
+      $('addReady').hidden = true;
+      $('addErr').hidden = false;
+      $('addErr').textContent = r.message || '登录被上游拒绝';
+      return;
+    }
     if (r.done) {
       stopPoll();
       $('addReady').hidden = true;
       $('addDone').hidden = false;
-      $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中';
+      const warn = r.balance_error ? '；但余额校验失败：' + r.balance_error + '（若持续 401，请在浏览器退出腾讯账号后重登）' : '';
+      $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中' + warn;
       setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
     }
+    if (!r.done && loginStartAt && Date.now() - loginStartAt > 90000 && $('addErr').hidden) {
+      $('addErr').hidden = false;
+      $('addErr').textContent = '仍在等待浏览器完成登录。若浏览器已显示「登录失败」，请关闭本窗口重新获取授权链接（链接 15 分钟内有效）。';
+    }
   } catch (e) {
-    stopPoll();
-    $('addReady').hidden = true;
-    $('addErr').hidden = false;
-    $('addErr').textContent = e.message + '（关闭后重新添加）';
+    if (e.status === 404 || e.status === 410) {
+      stopPoll();
+      $('addReady').hidden = true;
+      $('addErr').hidden = false;
+      $('addErr').textContent = '登录会话已过期，请关闭后重新添加';
+      return;
+    }
+    pollFails++;
+    if (pollFails >= POLL_MAX_FAILS) {
+      stopPoll();
+      $('addReady').hidden = true;
+      $('addErr').hidden = false;
+      $('addErr').textContent = '连续 ' + POLL_MAX_FAILS + ' 次查询失败，已停止轮询：' + e.message + '（授权可能已完成，可关闭后重新添加）';
+    }
   }
 }
 function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
@@ -1783,15 +1818,9 @@ const SCHOOL_TITLES = {
   task_student_verify: '学生认证 +100c（需真实认证，不做）',
 };
 
-/* ── 精简 QR 编码器（券码二维码用）────────────────────────────────────
-   规格子集：byte 模式、ECC L、版本 1-5（全部单纠错块，免块交织）、固定掩码 0。
-   完整性：规范允许任选掩码（解码器按格式信息位自行去掩码），固定掩码不影响
-   可扫描性；已用 python qrcode 库对多输入多版本做逐像素交叉验证（强制 byte
-   模式 + mask 0，5/5 全部 diff=0）。面板 CSP 只允许 self，外链 QR 服务不可用。 */
-// qr_gen.js —— 精简 QR 编码器（浏览器用 + node 可跑交叉验证）
-// 规格子集：byte 模式、ECC L、版本 1-5（全部单纠错块，免块交织）、固定掩码 0。
-// 完整性说明：规范允许编码器任选掩码（解码器按格式信息位自行去掩码），
-// 固定掩码不影响可扫描性；券码为短文本，v1-5（26 字节起）绰绰有余。
+/* ── 精简 QR 编码器（券码 + 登录授权链接用）────────────────────────────
+   规格子集：byte 模式、ECC L、版本 1-9（v6 起两块交织、v7 起带 BCH(6,18) 版本块）、固定掩码 0。
+   面板 CSP 只允许 self，外链 QR 服务不可用。 */
 
 // GF(256) 对数/指数表（本原多项式 0x11d）
 const QR_EXP = new Array(512), QR_LOG = new Array(256);
@@ -1802,10 +1831,10 @@ const QR_EXP = new Array(512), QR_LOG = new Array(256);
 })();
 const gmul = (a, b) => (a && b) ? QR_EXP[QR_LOG[a] + QR_LOG[b]] : 0;
 
-// 各版本参数（下标 = 版本-1）：[数据码字数, 纠错码字数]，ECC L 单块
-const QR_V = [[19, 7], [34, 10], [55, 15], [80, 20], [108, 26]];
-// 对齐图案中心坐标（v2+；与定位图案重叠的位置在放置时跳过）
-const QR_ALIGN = [[], [6, 18], [6, 22], [6, 26], [6, 30]];
+// 各版本参数（下标 = 版本-1）：[数据码字总数, 每块纠错码字数, 块数]，ECC L
+const QR_V = [[19, 7, 1], [34, 10, 1], [55, 15, 1], [80, 20, 1], [108, 26, 1], [136, 18, 2], [156, 20, 2], [194, 24, 2], [232, 30, 2]];
+// 对齐图案中心坐标（v2+）
+const QR_ALIGN = [[], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34], [6, 22, 38], [6, 24, 42], [6, 26, 46]];
 const QR_MASK = (r, c) => (r + c) % 2 === 0; // 掩码模式 0
 
 // 生成多项式（最高次系数在前，g[0] 恒为 1）
@@ -1858,8 +1887,8 @@ function qrMatrix(text) {
   // 版本选择：需求 ≈ 2 码字头 + 文本长度，取首个放得下的版本
   let ver = 0;
   for (let v = 0; v < QR_V.length; v++) { if (bytes.length + 2 <= QR_V[v][0]) { ver = v + 1; break; } }
-  if (!ver) throw new Error('QR: text too long (>' + QR_V[4][0] + ' bytes)');
-  const [dataCap, ecCap] = QR_V[ver - 1];
+  if (!ver) throw new Error('QR: text too long (>' + (QR_V[QR_V.length - 1][0] - 2) + ' bytes)');
+  const [dataCap, ecCap, nblk] = QR_V[ver - 1];
   const n = 17 + 4 * ver;
 
   const M = Array.from({ length: n }, () => new Array(n).fill(false));
@@ -1879,16 +1908,16 @@ function qrMatrix(text) {
   // 校正图形（仅贯穿两定位图案之间：8..n-9，不得覆盖定位图案本体）
   for (let r = 8; r <= n - 9; r++) setF(r, 6, r % 2 === 0);
   for (let c = 8; c <= n - 9; c++) setF(6, c, c % 2 === 0);
-  // 对齐图案（v2+，跳过与定位重叠处）
+  // 对齐图案（v2+，只跳过与三个定位图案 9×9 区域重叠的位置）
   const align = QR_ALIGN[ver - 1] || [];
+  const hitsFinder = (r, c) =>
+    (r <= 8 && c <= 8) || (r <= 8 && c >= n - 9) || (r >= n - 9 && c <= 8);
   for (const ar of align) for (const ac of align) {
-    if (F[ar][ac]) continue;
+    if (hitsFinder(ar, ac)) continue;
     for (let r = -2; r <= 2; r++) for (let c = -2; c <= 2; c++)
       setF(ar + r, ac + c, Math.max(Math.abs(r), Math.abs(c)) !== 1);
   }
   // 暗模块 + 格式信息（ECC L=01，掩码 0）——BCH(15,5) + 0x5412 异或。
-  // 位序遵循规范（与 python qrcode 逐位对齐验证）：bit i 从 LSB 起数，
-  // 副本一走左上角 L 形、副本二走右下 L 形。
   let fmt = (1 << 3) | 0; // L<<3 | mask
   let rem = fmt << 10;
   for (let i = 14; i >= 10; i--) if ((rem >> i) & 1) rem ^= 0x537 << (i - 10);
@@ -1904,11 +1933,26 @@ function qrMatrix(text) {
   for (let i = 9; i <= 14; i++) setF(8, 14 - i, !!fb(i));
   // 暗模块（恒为深色，位于副本一垂直段末端）
   setF(n - 8, 8, true);
+  // 版本信息块（v7+ 必填，18 位 BCH(6,18) 多项式 0x1F25）
+  if (ver >= 7) {
+    let vi = ver << 12;
+    for (let i = 17; i >= 12; i--) if ((vi >> i) & 1) vi ^= 0x1F25 << (i - 12);
+    vi = (ver << 12) | (vi & 0xFFF);
+    for (let i = 0; i < 18; i++) {
+      const bit = ((vi >> i) & 1) === 1;
+      setF((i / 3) | 0, n - 11 + i % 3, bit);
+      setF(n - 11 + i % 3, (i / 3) | 0, bit);
+    }
+  }
 
-
-  // 数据码字 + 纠错码字 → 位流
+  // 数据码字 + 纠错码字（分块交织） → 位流
   const dcw = qrDataCodewords(text, dataCap);
-  const cw = dcw.concat(rsRem(dcw, ecCap));
+  const per = dataCap / nblk;
+  const blk = Array.from({ length: nblk }, (_, i) => dcw.slice(i * per, (i + 1) * per));
+  const ecs = blk.map(b => rsRem(b, ecCap));
+  const cw = [];
+  for (let i = 0; i < per; i++) for (const b of blk) cw.push(b[i]);
+  for (let i = 0; i < ecCap; i++) for (const e of ecs) cw.push(e[i]);
   const bits = [];
   for (const b of cw) for (let i = 7; i >= 0; i--) bits.push((b >> i) & 1);
 

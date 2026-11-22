@@ -376,6 +376,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 .vc .ft .acts { margin-left: auto; display: flex; gap: 8px; flex: none; }
 .vc .vc-qr { border-top: 1px dashed var(--line); padding: 14px; display: flex; justify-content: center; }
 .vc .vc-qr svg { border-radius: 6px; }
+.qrbox { display: flex; justify-content: center; margin: 0 0 12px; }
+.qrbox svg { border-radius: 6px; }
 /* 过期态：只淡标题与元信息（保持券码可读），边框改虚线示意作废 */
 .vc.expired { border-style: dashed; }
 .vc.expired .hd, .vc.expired .meta { opacity: .55; }
@@ -1351,8 +1353,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
         <div id="addLoad" class="state" hidden><span class="dots">正在获取授权链接</span></div>
         <div id="addReady" hidden>
-          <div class="state">在浏览器打开以下链接并登录：</div>
+          <div class="state">在浏览器打开以下链接并登录，或用手机扫码（15 分钟内有效）：</div>
           <div class="url" id="addUrl"></div>
+          <div class="qrbox" id="addQr" hidden></div>
           <div class="state" id="addPoll"><span class="dots">等待授权完成，自动检测中</span></div>
         </div>
         <div id="addDone" class="state ok" hidden></div>

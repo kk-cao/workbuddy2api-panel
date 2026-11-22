@@ -697,3 +697,40 @@ func TestClassifyRealChannelRefusedBody(t *testing.T) {
 		t.Fatalf("Classify(real 11-128, 403)=%v want ErrChannelRefused", got)
 	}
 }
+
+func TestClassifyQueueWaiting6020AndRetryAfterBody(t *testing.T) {
+	const body6020 = `{"code":6020,"msg":"queue.waiting.title","requestId":"01a181ca3b67934d01c3f64599c8490c","data":{"queue_position":2502,"queue_size":"999+","retry_after":40,"estimated_wait":12510}}`
+	if got := Classify(429, body6020); got != ErrUpstreamBusy {
+		t.Fatalf("Classify(429, 6020)=%v want ErrUpstreamBusy", got)
+	}
+	if got := Classify(500, body6020); got != ErrUpstreamBusy {
+		t.Fatalf("Classify(500, 6020)=%v want ErrUpstreamBusy", got)
+	}
+	if got := Classify(429, `{"code":1,"requestId":"6020"}`); got != ErrSoftRate {
+		t.Fatalf("requestId 含 6020 不应误判 ErrUpstreamBusy: got=%v", got)
+	}
+	if d, ok := parseQueueRetryAfter([]byte(body6020)); !ok || d != 40*time.Second {
+		t.Fatalf("parseQueueRetryAfter(6020)=(%v,%v) want (40s,true)", d, ok)
+	}
+	if d, ok := parseQueueRetryAfter([]byte(`{"code":11134,"retry_policy":{"retry":true,"retry_after":12}}`)); !ok || d != 12*time.Second {
+		t.Fatalf("parseQueueRetryAfter(11134)=(%v,%v) want (12s,true)", d, ok)
+	}
+	if d, ok := parseQueueRetryAfter([]byte(`{"data":{"retry_after":999999}}`)); !ok || d != retryAfterSanity {
+		t.Fatalf("超限 retry_after 应封顶到 %v: got=(%v,%v)", retryAfterSanity, d, ok)
+	}
+	if _, ok := parseQueueRetryAfter([]byte(`{"data":{"retry_after":0}}`)); ok {
+		t.Fatal("非正 retry_after 不应命中")
+	}
+
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(429, body6020), nil
+	})
+	bodyStream, status, raw, err := c.ChatStreamContext(t.Context(), &auth.Auth{UID: "u1", AccessToken: "at"}, []byte(`{"model":"glm-5.2"}`), "", ChatMeta{})
+	if bodyStream != nil || status != 429 || len(raw) == 0 {
+		t.Fatalf("unexpected result: status=%d len=%d", status, len(raw))
+	}
+	ue, ok := err.(*Error)
+	if !ok || ue.Kind != ErrUpstreamBusy || ue.RetryAfter != 40*time.Second {
+		t.Fatalf("err=%+v want ErrUpstreamBusy RetryAfter=40s", err)
+	}
+}

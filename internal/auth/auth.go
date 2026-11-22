@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/safefile"
 )
 
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或手写扁平形）。
@@ -44,6 +44,11 @@ type Auth struct {
 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
+
+	// 来源文件是新版桌面端的 $wbEncrypted 加密形态（见 wbencrypted.go）时才非零。
+	wbSealed        map[string]bool
+	wbDoc           map[string]any
+	expiresAtMillis bool
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -234,10 +239,27 @@ func (a *Auth) IsEnterpriseSession() bool {
 	return jwtTokenSource(a.AccessTokenValue()) == "enterprise_switch"
 }
 
-// jwtTokenSource 解出 JWT payload 中的 token_source 声明；非 JWT / 解码失败
-// 一律返回 ""（老 token 与非标准形态按无此声明处理，零回归）。先按无填充
-// base64url 解（JWT 标准），失败再试带填充形态（兼容非标准签发方）。
-func jwtTokenSource(token string) string {
+// TokenSource 从 AccessToken JWT payload 读取 token_source 声明。
+func (a *Auth) TokenSource() string {
+	if a == nil {
+		return ""
+	}
+	return jwtClaim(a.AccessTokenValue(), "token_source")
+}
+
+// IdSource 从 AccessToken JWT payload 读取 id_source 声明。
+func (a *Auth) IdSource() string {
+	if a == nil {
+		return ""
+	}
+	return jwtClaim(a.AccessTokenValue(), "id_source")
+}
+
+// jwtTokenSource 解出 JWT payload 中的 token_source 声明；非 JWT / 解码失败一律返回 ""。
+func jwtTokenSource(token string) string { return jwtClaim(token, "token_source") }
+
+// jwtClaim 解出 JWT payload 中的指定字符串声明；非 JWT / 解码失败返回空。
+func jwtClaim(token, name string) string {
 	parts := strings.Split(token, ".")
 	if len(parts) < 2 {
 		return ""
@@ -248,13 +270,12 @@ func jwtTokenSource(token string) string {
 			return ""
 		}
 	}
-	var payload struct {
-		TokenSource string `json:"token_source"`
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
+	var payload map[string]any
+	if json.Unmarshal(raw, &payload) != nil {
 		return ""
 	}
-	return payload.TokenSource
+	v, _ := payload[name].(string)
+	return strings.TrimSpace(v)
 }
 
 // isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。
@@ -282,6 +303,11 @@ func Parse(raw []byte) (*Auth, error) {
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("empty auth storage")
 	}
+	dec, sealed, wbDoc, err := decryptWBEncrypted(raw)
+	if err != nil {
+		return nil, err
+	}
+	raw = dec
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &probe); err != nil {
 		return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -348,10 +374,25 @@ func Parse(raw []byte) (*Auth, error) {
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}
+	rawExpires := a.ExpiresAt
+	a.ExpiresAt = normalizeExpiresAt(a.ExpiresAt)
+	if len(sealed) > 0 {
+		a.wbSealed, a.wbDoc, a.expiresAtMillis = sealed, wbDoc, a.ExpiresAt != rawExpires
+	}
 	return &a, nil
 }
 
-// SaveAtomic 以嵌套形原子写回 FilePath（tmp + rename），保持嵌套形（插件可读）格式。
+const expiresAtMillisThreshold = 100_000_000_000
+
+// normalizeExpiresAt 把毫秒时间戳的 expiresAt 归一到 Unix 秒。
+func normalizeExpiresAt(v int64) int64 {
+	if v > expiresAtMillisThreshold {
+		return v / 1000
+	}
+	return v
+}
+
+// SaveAtomic 以嵌套形原子写回 FilePath（fsync + rename），对 $wbEncrypted 来源自动重封。
 // 全程持 a.mu：防止与 RefreshToken 修改 token 字段并发，杜绝写回半更新。
 // 防御：accessToken 为空时拒绝写回，避免误用空凭证覆盖有效文件。
 func (a *Auth) SaveAtomic() error {
@@ -363,34 +404,41 @@ func (a *Auth) SaveAtomic() error {
 	if a.FilePath == "" {
 		return fmt.Errorf("no FilePath set")
 	}
-	doc := map[string]any{
-		"auth": map[string]any{
-			"accessToken":  a.AccessToken,
-			"refreshToken": a.RefreshToken,
-			"expiresAt":    a.ExpiresAt,
-			"domain":       a.Domain,
-			"realm":        a.realm,
-		},
-		"account": map[string]any{
-			"uid":          a.UID,
-			"enterpriseId": a.EnterpriseID,
-			"nickname":     a.Nickname,
-		},
-	}
-	// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
-	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
-	if a.DeviceToken != "" {
-		doc["device_token"] = a.DeviceToken
+	var doc map[string]any
+	if len(a.wbSealed) > 0 {
+		doc = a.wbOverlayLocked()
+		if err := sealForSave(doc, a.wbSealed); err != nil {
+			return err
+		}
+	} else {
+		doc = map[string]any{
+			"auth": map[string]any{
+				"accessToken":  a.AccessToken,
+				"refreshToken": a.RefreshToken,
+				"expiresAt":    a.ExpiresAt,
+				"domain":       a.Domain,
+				"realm":        a.realm,
+			},
+			"account": map[string]any{
+				"uid":          a.UID,
+				"enterpriseId": a.EnterpriseID,
+				"nickname":     a.Nickname,
+			},
+		}
+		// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
+		// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
+		if a.DeviceToken != "" {
+			doc["device_token"] = a.DeviceToken
+		}
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := a.FilePath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	if err := safefile.WriteKeep(a.FilePath, raw, 0o600); err != nil {
 		// Docker bind-mount 权限问题的典型现场：容器内 app 用户（uid 10001）
 		// 对宿主机挂载目录无写权限。给出可操作指引而不是裸 syscall 错误。
-		msg := fmt.Sprintf("写入 %s 失败: %v", tmp, err)
+		msg := fmt.Sprintf("写入 %s 失败: %v", a.FilePath, err)
 		if errors.Is(err, fs.ErrPermission) {
 			msg += "\n（Docker 部署：容器内用户对宿主机挂载目录无写权限。解法任选：" +
 				"1) 以本机 uid 运行容器：PUID=$(id -u) PGID=$(id -g) docker compose up -d；" +
@@ -399,10 +447,62 @@ func (a *Auth) SaveAtomic() error {
 		}
 		return errors.New(msg)
 	}
-	return os.Rename(tmp, a.FilePath)
+	return nil
 }
 
-// LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。
+// wbOverlayLocked 在解密底稿上覆盖管理字段并按原有单位写回 expiresAt。调用方须持 a.mu。
+func (a *Auth) wbOverlayLocked() map[string]any {
+	doc := cloneJSON(a.wbDoc).(map[string]any)
+	authObj, nested := doc["auth"].(map[string]any)
+	accObj := doc
+	if nested {
+		if accObj, _ = doc["account"].(map[string]any); accObj == nil {
+			accObj = map[string]any{}
+			doc["account"] = accObj
+		}
+	} else {
+		authObj = doc
+	}
+	set := func(m map[string]any, k string, v any, empty bool) {
+		if _, has := m[k]; has || !empty {
+			m[k] = v
+		}
+	}
+	exp := a.ExpiresAt
+	if a.expiresAtMillis {
+		exp *= 1000
+	}
+	set(authObj, "accessToken", a.AccessToken, false)
+	set(authObj, "refreshToken", a.RefreshToken, a.RefreshToken == "")
+	set(authObj, "expiresAt", exp, a.ExpiresAt == 0)
+	set(authObj, "domain", a.Domain, a.Domain == "")
+	set(authObj, "realm", a.realm, a.realm == "")
+	set(accObj, "uid", a.UID, a.UID == "")
+	set(accObj, "enterpriseId", a.EnterpriseID, a.EnterpriseID == "")
+	set(accObj, "nickname", a.Nickname, a.Nickname == "")
+	set(doc, "device_token", a.DeviceToken, a.DeviceToken == "")
+	return doc
+}
+
+func cloneJSON(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		m := make(map[string]any, len(t))
+		for k, x := range t {
+			m[k] = cloneJSON(x)
+		}
+		return m
+	case []any:
+		s := make([]any, len(t))
+		for i, x := range t {
+			s[i] = cloneJSON(x)
+		}
+		return s
+	}
+	return v
+}
+
+// LoadDir 扫描并解析 dir 下 workbuddy*.json；坏文件优先回退 .bak。
 // 顺带做 realm 标识存量迁移：对空 realm 的 auth 自动 backfill（原始 domain 推断）并 SaveAtomic
 // 落盘，一次性把旧文件补上 realm 键。单个文件写失败不阻断启动（log WARN 继续），
 // 避免历史 auth 目录个别文件不可写时整个服务起不来。
@@ -416,7 +516,10 @@ func LoadDir(dir string) ([]*Auth, error) {
 	seenUID := make(map[string]string, len(files))
 	var out []*Auth
 	for _, f := range files {
-		raw, err := os.ReadFile(f)
+		raw, err := safefile.Read(f, func(b []byte) bool {
+			_, perr := Parse(b)
+			return perr == nil
+		})
 		if err != nil {
 			continue
 		}

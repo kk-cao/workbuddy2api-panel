@@ -61,6 +61,95 @@ const sanitizeInjectedIdentityReplacement = "When asked about your capabilities,
 // sanitizeModelIdentityTagRe 剥离 <model_identity>...</model_identity> 标签外壳，保留内部文本。
 var sanitizeModelIdentityTagRe = regexp.MustCompile(`(?i)</?model_identity>`)
 
+// sanitizeIdentitySentenceRe 泛化改写「自我介绍 + 品牌/模型归属」整句，防非官方渠道特征拦截。
+var sanitizeIdentitySentenceRe = regexp.MustCompile(
+	`(?i)You are\s+` +
+		`(?:an?\s+|the\s+)?(?:[\w.-]+\s+){0,3}?` +
+		`(?:agent|assistant|model|AI|LLM)?[\s,]*` +
+		`(?:powered by|built on|built by|created by|developed by|made by|trained by)` +
+		`[^\n]*?\.(\s|$)`)
+
+const sanitizeIdentitySentenceReplacement = "You are a helpful AI assistant.${1}"
+
+var sanitizeBareHdrProbe = func() string {
+	const foldPrefix = "(?i)"
+	s := sanitizeBareHdrRe.String()
+	if !strings.HasPrefix(s, foldPrefix) {
+		return ""
+	}
+	body := s[len(foldPrefix):]
+	if body == "" || strings.ContainsAny(body, `\[](){}*+?|^$.`) {
+		return ""
+	}
+	return body
+}()
+
+// containsFoldASCII 零分配 ASCII 大小写不敏感子串查找，替代 RE2 `(?i)` 预检。
+func containsFoldASCII(s, sub string) bool {
+	if sub == "" {
+		return true
+	}
+	n := len(sub)
+	if len(s) < n {
+		return false
+	}
+	c0 := sub[0]
+	var alt0 byte
+	if c0 >= 'a' && c0 <= 'z' {
+		alt0 = c0 - ('a' - 'A')
+	} else if c0 >= 'A' && c0 <= 'Z' {
+		alt0 = c0 + ('a' - 'A')
+	} else {
+		alt0 = c0
+	}
+	limit := len(s) - n
+	for i := 0; i <= limit; i++ {
+		if s[i] != c0 && s[i] != alt0 {
+			continue
+		}
+		match := true
+		for j := 1; j < n; j++ {
+			a, b := s[i+j], sub[j]
+			if a == b {
+				continue
+			}
+			if (a|0x20) == (b|0x20) && ((a|0x20) >= 'a' && (a|0x20) <= 'z') {
+				continue
+			}
+			match = false
+			break
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// hasIdentityVerbShape 单遍扫描判断是否存在「 by 」或「 on 」，作为身份句式预检快速路径。
+func hasIdentityVerbShape(s string) bool {
+	for i := 0; i+3 <= len(s); i++ {
+		c := s[i] | 0x20
+		var want byte
+		switch c {
+		case 'b':
+			want = 'y'
+		case 'o':
+			want = 'n'
+		default:
+			continue
+		}
+		if s[i+1]|0x20 != want || s[i+2] != ' ' {
+			continue
+		}
+		if i > 0 && s[i-1] != ' ' {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 // sanitizeRewrites 改写层：全模板句逐字替换（每句只改一词，语义不变）。
 //
 // 身份句的匹配串**不带结尾标点**（只到 "…for Claude" 为止）：
@@ -122,7 +211,8 @@ func sanitizeTextWithOpts(text string, systemRole, assistantOrReasoning bool) st
 	hasGlobal := hasFingerprint(text)
 	hasSys := systemRole && (strings.Contains(text, "workspace root") || strings.Contains(text, "Workspace root"))
 	hasInjected := assistantOrReasoning && hasInjectedIdentity(text)
-	if !hasGlobal && !hasSys && !hasInjected {
+	hasIdentitySent := hasIdentityVerbShape(text) && sanitizeIdentitySentenceRe.MatchString(text)
+	if !hasGlobal && !hasSys && !hasInjected && !hasIdentitySent {
 		return text
 	}
 	if hasInjected {
@@ -131,7 +221,11 @@ func sanitizeTextWithOpts(text string, systemRole, assistantOrReasoning bool) st
 			text = sanitizeInjectedIdentityRe.ReplaceAllString(text, sanitizeInjectedIdentityReplacement)
 		}
 	}
-	if hasGlobal {
+	if hasIdentitySent {
+		// 先于品牌词替换，防止品牌名先被改写导致句式正则漏匹配。
+		text = sanitizeIdentitySentenceRe.ReplaceAllString(text, sanitizeIdentitySentenceReplacement)
+	}
+	if hasGlobal || hasIdentitySent {
 		for _, rw := range sanitizeRewrites {
 			text = strings.ReplaceAll(text, rw[0], rw[1])
 		}
@@ -163,18 +257,17 @@ func hasInjectedIdentity(text string) bool {
 	return strings.Contains(lower, "model_identity") || strings.Contains(lower, "identify yourself as")
 }
 
-// hasFingerprint 特征预检：先走 strings.Contains 快速路径（零分配）；
-// header 键名有大小写变体（X-Anthropic-...）且可能以裸键名形态出现（无冒号），
-// Contains 大小写敏感、sanitizeHdrRe 要求冒号——两者都会漏掉「混合大小写 + 裸键名」，
-// 必须再用不要求冒号的 (?i) 正则兜底（sanitizeBareHdrRe），否则整条净化被跳过。
-// sanitizeBareHdrRe 不要求冒号，是 sanitizeHdrRe 的超集，故无需再单独匹配后者。
+// hasFingerprint 特征预检：先走 strings.Contains 快速路径，再以零分配 ASCII 折叠扫裸 header 键名。
 func hasFingerprint(text string) bool {
 	for _, f := range sanitizeFeatures {
 		if strings.Contains(text, f) {
 			return true
 		}
 	}
-	return sanitizeBareHdrRe.MatchString(text)
+	if sanitizeBareHdrProbe == "" {
+		return sanitizeBareHdrRe.MatchString(text)
+	}
+	return containsFoldASCII(text, sanitizeBareHdrProbe)
 }
 
 // sanitizeContent 兼容字符串与多模态数组；只动 text part，image 等 part 不动。
@@ -282,4 +375,27 @@ func sanitizeMessages(messages []any) bool {
 		}
 	}
 	return changed
+}
+
+// sanitizeTools 净化 OpenAI tools[].function.description，清除身份句及黑名单指纹。
+func sanitizeTools(v any) {
+	tools, ok := v.([]any)
+	if !ok {
+		return
+	}
+	for _, t := range tools {
+		tm, ok := t.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, ok := tm["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if d, ok := fn["description"].(string); ok {
+			if s := sanitizeText(d); s != d {
+				fn["description"] = s
+			}
+		}
+	}
 }

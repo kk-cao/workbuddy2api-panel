@@ -576,3 +576,144 @@ func TestPrepareBodyDropsReasoningTextParts(t *testing.T) {
 		}
 	}
 }
+
+func TestPrepareBodyOptNormalizeStop(t *testing.T) {
+	cases := []struct {
+		name, in, wantStop string
+	}{
+		{"字符串形态转数组", `{"model":"m","stop":"\n\nHuman:"}`, `"stop":["\n\nHuman:"]`},
+		{"保留空白", `{"model":"m","stop":" END "}`, `"stop":[" END "]`},
+		{"空串保留", `{"model":"m","stop":""}`, `"stop":[""]`},
+		{"数组形态原样", `{"model":"m","stop":["a","b"]}`, `"stop":["a","b"]`},
+	}
+	for _, c := range cases {
+		out := string(PrepareBodyOpt([]byte(c.in), false))
+		if !strings.Contains(out, c.wantStop) {
+			t.Errorf("%s: out=%s want %s", c.name, out, c.wantStop)
+		}
+	}
+	if out := string(PrepareBodyOpt([]byte(`{"model":"m","stop":null}`), false)); !strings.Contains(out, `"stop":null`) {
+		t.Errorf("null stop should remain null: %s", out)
+	}
+	if out := string(PrepareBodyOpt([]byte(`{"model":"m"}`), false)); strings.Contains(out, "stop") {
+		t.Errorf("absent stop should stay absent: %s", out)
+	}
+}
+
+func TestInjectCatalogMaxTokens(t *testing.T) {
+	maxOut := map[string]int64{"deepseek-v4.1-flash": 393216}
+	check := func(body []byte, want float64, absent bool) {
+		t.Helper()
+		var m map[string]any
+		if err := json.Unmarshal(body, &m); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		got, has := m["max_tokens"]
+		if absent {
+			if has {
+				t.Fatalf("max_tokens should be absent, got %v", got)
+			}
+			return
+		}
+		if !has || got != want {
+			t.Fatalf("max_tokens=%v want %v", got, want)
+		}
+	}
+	check(PrepareBodyOptWithEffortsDefaultAndCaps([]byte(`{"model":"deepseek-v4.1-flash","messages":[]}`), false, nil, nil, maxOut), 393216, false)
+	check(PrepareBodyOptWithEffortsDefaultAndCaps([]byte(`{"model":"global:deepseek-v4.1-flash","messages":[]}`), false, nil, nil, maxOut), 393216, false)
+	check(PrepareBodyOptWithEffortsDefaultAndCaps([]byte(`{"model":"deepseek-v4.1-flash","max_tokens":123,"messages":[]}`), false, nil, nil, maxOut), 123, false)
+	check(PrepareBodyOptWithEffortsDefaultAndCaps([]byte(`{"model":"deepseek-v4.1-flash","max_completion_tokens":456,"messages":[]}`), false, nil, nil, maxOut), 456, false)
+	check(PrepareBodyOptWithEffortsDefaultAndCaps([]byte(`{"model":"unknown","messages":[]}`), false, nil, nil, maxOut), 0, true)
+	check(PrepareBodyOptWithEffortsDefaultAndCaps([]byte(`{"model":"deepseek-v4.1-flash","messages":[]}`), false, nil, nil, nil), 0, true)
+}
+
+func TestNormalizeToolParameters11129(t *testing.T) {
+	t.Run("empty parameters inflated", func(t *testing.T) {
+		body := `{"model":"deepseek-v4.1-flash","messages":[],"tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}`
+		obj, _ := decodeBody(PrepareBodyOpt([]byte(body), false))
+		params := obj["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)
+		if params["type"] != "object" {
+			t.Errorf("type=%v want object", params["type"])
+		}
+		if _, ok := params["properties"].(map[string]any); !ok {
+			t.Errorf("properties not map: %v", params["properties"])
+		}
+	})
+
+	t.Run("nil removed, python types, minimum string coerced, enum inferred, required property kept", func(t *testing.T) {
+		body := `{"model":"m","messages":[],"tools":[{"type":"function","function":{"name":"f","parameters":{
+			"type":"object","description":null,"additionalProperties":"false",
+			"properties":{
+				"name":{"type":"str","description":null,"pattern":"^[^\\uD800-\\uDFFF]*$"},
+				"count":{"type":"int","minimum":"1","uniqueItems":"true"},
+				"ratio":{"type":"float"},
+				"flag":{"type":"bool"},
+				"meta":{"type":"dict","title":null},
+				"tags":{"type":"list","items":[{"type":"str"}]},
+				"kind":{"enum":["a","b"]},
+				"required":{"type":"boolean"}
+			},
+			"required":["name",null,"","name"]
+		}}}]}`
+		obj, err := decodeBody(PrepareBodyOpt([]byte(body), false))
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		params := obj["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)
+		if _, exists := params["description"]; exists {
+			t.Errorf("nil description should be deleted")
+		}
+		if params["additionalProperties"] != false {
+			t.Errorf("additionalProperties=%v want false", params["additionalProperties"])
+		}
+		req := params["required"].([]any)
+		if len(req) != 1 || req[0] != "name" {
+			t.Errorf("required=%v want [name]", req)
+		}
+		props := params["properties"].(map[string]any)
+		if props["name"].(map[string]any)["type"] != "string" {
+			t.Errorf("str not normalized: %v", props["name"])
+		}
+		if gotPat := props["name"].(map[string]any)["pattern"].(string); !strings.Contains(gotPat, `\x{D800}`) {
+			t.Errorf("\\uD800 not translated to \\x{D800}: %q", gotPat)
+		}
+		cnt := props["count"].(map[string]any)
+		if cnt["type"] != "integer" || cnt["minimum"] != float64(1) || cnt["uniqueItems"] != true {
+			t.Errorf("count coerce mismatch: %v", cnt)
+		}
+		if props["ratio"].(map[string]any)["type"] != "number" ||
+			props["flag"].(map[string]any)["type"] != "boolean" ||
+			props["meta"].(map[string]any)["type"] != "object" {
+			t.Errorf("python aliases mismatch: %v", props)
+		}
+		tags := props["tags"].(map[string]any)
+		if tags["type"] != "array" || tags["items"].(map[string]any)["type"] != "string" {
+			t.Errorf("tags tuple items mismatch: %v", tags)
+		}
+		if props["kind"].(map[string]any)["type"] != "string" {
+			t.Errorf("enum type not inferred: %v", props["kind"])
+		}
+		if _, ok := props["required"].(map[string]any); !ok {
+			t.Errorf("property literally named 'required' must survive: %v", props)
+		}
+	})
+
+	t.Run("top ref inlined and cycle safe", func(t *testing.T) {
+		body := `{"model":"m","tools":[{"type":"function","function":{"name":"f","parameters":{"$ref":"#/$defs/Args","$defs":{"Args":{"type":"object","properties":{"x":{"type":"str"}}}}}}}]}`
+		obj, _ := decodeBody(PrepareBodyOpt([]byte(body), false))
+		params := obj["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)
+		if _, hasRef := params["$ref"]; hasRef {
+			t.Errorf("top $ref must be removed")
+		}
+		if props, ok := params["properties"].(map[string]any); !ok || props["x"].(map[string]any)["type"] != "string" {
+			t.Errorf("top $ref not inlined: %v", params)
+		}
+
+		cyc := `{"model":"m","tools":[{"type":"function","function":{"name":"f","parameters":{"$ref":"#/$defs/A","$defs":{"A":{"$ref":"#/$defs/B"},"B":{"$ref":"#/$defs/A"}}}}}]}`
+		cObj, _ := decodeBody(PrepareBodyOpt([]byte(cyc), false))
+		cParams := cObj["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)
+		if cParams["type"] != "object" {
+			t.Errorf("cyclic $ref should degrade cleanly to object: %v", cParams)
+		}
+	})
+}

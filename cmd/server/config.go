@@ -14,6 +14,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // Config 顶层配置。
@@ -177,6 +178,8 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// TLSFingerprint 出站 TLS ClientHello 指纹档位（"" / "node" 复刻官方 / "go" 原生回退）。
+		TLSFingerprint string `json:"tls_fingerprint"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -491,6 +494,9 @@ func applyEnv(c *Config) {
 			c.Upstream.PassthroughIP = b
 		}
 	}
+	if v := os.Getenv("WB2A_TLS_FINGERPRINT"); v != "" {
+		c.Upstream.TLSFingerprint = v
+	}
 	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.SanitizeBlacklistFingerprints = b
@@ -627,6 +633,11 @@ func (c *Config) normalize() error {
 	}
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
+	}
+	if normFP, err := upstream.ValidateTLSFingerprint(c.Upstream.TLSFingerprint); err != nil {
+		return err
+	} else {
+		c.Upstream.TLSFingerprint = normFP
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen

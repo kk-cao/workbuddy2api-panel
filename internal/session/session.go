@@ -397,7 +397,20 @@ func hasUserIDKey(obj map[string]any) bool {
 // 即便客户端恰好传了形如 "d-<hex>" 的显式 id 也不至于与派生键混淆（显式 id 优先返回）。
 const derivedKeyPrefix = "d-"
 
-// deriveKey 从消息内容派生稳定会话键：SHA-256(system 文本 + 首条 user 文本) 前 16 字节。
+// DeriveCacheKey 仅供 prompt_cache_key / X-Conversation-ID / X-Root-Request-ID 会话段使用：
+// 与 ExtractKey 的内容派生同源，但不受 user_id 抑制闸拦截，避免带 user_id 的客户端缓存槽退化。
+func DeriveCacheKey(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return ""
+	}
+	return deriveKey(obj)
+}
+
+// deriveKey 从消息内容派生稳定会话键：SHA-256([caller_id + \x00] + system 文本 + \x00 + 首条 user 文本) 前 16 字节。
 //
 // 为什么用「system + 首条 user」而不是全部消息：
 //   - 多轮对话里历史消息每轮追加，全量哈希会每轮变化 → 粘性完全失效；
@@ -437,8 +450,27 @@ func deriveKey(obj map[string]any) string {
 	if firstUserText == "" {
 		return "" // 无用户消息：无从归属会话
 	}
-	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
+	payload := systemText + "\x00" + firstUserText
+	if cid := callerIDOf(obj); cid != "" {
+		// 掺入调用方（user_id / user）：不同下游用户相同开场白时分槽隔离（#234）；
+		// 无调用方标识时输入串与旧实现逐字节相同，零回归。
+		payload = cid + "\x00" + payload
+	}
+	sum := sha256.Sum256([]byte(payload))
 	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
+}
+
+// callerIDOf 提取请求侧调用方标识（metadata.user_id 优先，其次顶层 user_id / user）。
+func callerIDOf(obj map[string]any) string {
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		if v := strOrEmpty(meta["user_id"]); v != "" {
+			return v
+		}
+	}
+	if v := strOrEmpty(obj["user_id"]); v != "" {
+		return v
+	}
+	return strOrEmpty(obj["user"])
 }
 
 // userContentSignature 把已解析的 content（any）转回 RawMessage 后取**会话级稳定**

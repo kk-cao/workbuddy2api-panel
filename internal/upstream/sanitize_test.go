@@ -463,3 +463,63 @@ func TestSanitizeModelIdentityOnlyInAssistantAndReasoning(t *testing.T) {
 		t.Errorf("reasoning_content leaked injected identity directive: %q", rcText)
 	}
 }
+
+func TestSanitizeToolsDescription(t *testing.T) {
+	body := `{
+		"model":"glm-5.3-flash",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[
+			{"type":"function","function":{"name":"read","description":"You are Claude Code, Anthropic's official CLI for Claude. Search inside workspace root."}},
+			{"type":"function","function":{"name":"write","description":"You are an AI agent powered by AcmeModel. Write files."}}
+		]
+	}`
+	out := string(PrepareBodyOpt([]byte(body), true))
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	tools := obj["tools"].([]any)
+	d0 := tools[0].(map[string]any)["function"].(map[string]any)["description"].(string)
+	if strings.Contains(d0, "official CLI for Claude") || !strings.Contains(d0, "official CLI tool for Claude") {
+		t.Errorf("tool[0] Claude identity not rewritten: %q", d0)
+	}
+	if !strings.Contains(d0, "workspace root") {
+		t.Errorf("workspace root in tool description should stay untouched: %q", d0)
+	}
+	d1 := tools[1].(map[string]any)["function"].(map[string]any)["description"].(string)
+	if strings.Contains(d1, "AcmeModel") || !strings.HasPrefix(d1, "You are a helpful AI assistant.") {
+		t.Errorf("tool[1] powered-by identity not generalized: %q", d1)
+	}
+}
+
+func TestIdentitySentenceVariants(t *testing.T) {
+	const neutral = "You are a helpful AI assistant."
+	for _, in := range []string{
+		"You are an AI agent powered by AcmeRuntime. Next.",
+		"You are a coding agent powered by the deepseek-v4.1-flash model. Next.",
+		"You are an AI assistant built on DeepSeek. Next.",
+		"You are Acme Agent, built by Acme Corp. Next.",
+		"You are the FooBot assistant, created by someone. Next.",
+		"You are a bot developed by someone. Next.",
+		"You are a tool made by someone. Next.",
+		"You are a model trained by someone. Next.",
+	} {
+		out := sanitizeText(in)
+		if !strings.HasPrefix(out, neutral) || !strings.Contains(out, "Next.") {
+			t.Errorf("identity variant mismatch: %q -> %q", in, out)
+		}
+	}
+}
+
+func TestIdentitySentenceFalsePositives(t *testing.T) {
+	for _, in := range []string{
+		"You are free to use tools built by the vendor.",
+		"You are a helpful assistant that uses services developed by others. Ok.",
+		"You are welcome to deploy packages made by third parties.",
+		"You are right, that module was built by the other team. Fine.",
+	} {
+		if out := sanitizeText(in); out != in {
+			t.Errorf("false positive rewrite: %q -> %q", in, out)
+		}
+	}
+}

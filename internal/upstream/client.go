@@ -4,12 +4,14 @@ package upstream
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -527,6 +529,33 @@ func parseRetryNumber(v, headerName string) (time.Duration, bool) {
 	}
 }
 
+// parseQueueRetryAfter 从排队/容量信封的 JSON body 抽上游明示的重试等待秒数（data.retry_after
+// 或 retry_policy.retry_after），超 retryAfterSanity 按上限封顶。解析不到或非正返回 false。
+func parseQueueRetryAfter(body []byte) (time.Duration, bool) {
+	var env struct {
+		Data struct {
+			RetryAfter int64 `json:"retry_after"`
+		} `json:"data"`
+		RetryPolicy struct {
+			RetryAfter int64 `json:"retry_after"`
+		} `json:"retry_policy"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return 0, false
+	}
+	secs := env.Data.RetryAfter
+	if secs <= 0 {
+		secs = env.RetryPolicy.RetryAfter
+	}
+	if secs <= 0 {
+		return 0, false
+	}
+	if secs > int64(retryAfterSanity/time.Second) {
+		return retryAfterSanity, true
+	}
+	return time.Duration(secs) * time.Second, true
+}
+
 // ParseRateReset 从任何限流响应 body 里统一解析「将在 … 重置」时间（上游 UTC+8 文案）。
 // 成功返回解析出的**墙钟时刻**（按 UTC+8 解释），失败返回零值 + false。
 //
@@ -637,13 +666,11 @@ func Classify(status int, body string) ErrKind {
 	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14018") {
 		return ErrHardCredit
 	}
-	// 6021「queue.full.title」是**渠道级容量满载**（上游推理集群排队队列打满），
-	// 不是账号问题：同一时刻换任何账号都会撞同一堵墙。必须先于通用 429 兜底，
-	// 否则会按 ErrSoftRate 逐号软冷却——实测 2 秒内即可把整池健康号全部误杀
-	// 冷却（2026-10-15 实案），且换号白撞放大请求量。429 + 结构化 code 为主判据
-	// （与 14018 同口径）；"queue.full" 固定文案单列为外卡——该文案是上游 i18n
-	// key 原文，语义唯一，非 429 状态码出现同样归本类（防上游换状态码）。
-	if (status == http.StatusTooManyRequests && hasBusinessCode(body, "6021")) || isQueueFullBody(lower) {
+	// 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满：
+	// 不是账号问题——同一时刻换任何账号都撞同一堵墙，按 ErrSoftRate 逐号软冷却会在
+	// 秒级把整池健康号全部误杀。结构化 code 主判（不绑定 429 防上游换状态码，也不会
+	// 撞进 requestId 等非 code 字段），"queue.full" 固定文案外卡兜底。
+	if hasBusinessCode(body, "6020") || hasBusinessCode(body, "6021") || isQueueFullBody(lower) {
 		return ErrUpstreamBusy
 	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
@@ -767,6 +794,13 @@ type Client struct {
 	// modelRates 缓存各模型当前生效积分倍率（规范化数值，如 "0.5"）。
 	// 与 efforts 共用 realm 分层和锁；每次成功刷新模型目录时整体替换对应域。
 	modelRates map[string]map[string]string
+	// exclusive 缓存各域里免费号调不通的模型（modelTiers accessMode=exclusive）。
+	exclusive map[string]map[string]bool
+	// modelMaxOut 缓存各模型输出上限（maxOutputTokens，随模型目录刷新）。
+	modelMaxOut map[string]map[string]int64
+	// paidMu/paidByUID 缓存各账号是否付费（来自 global billing summary 的 IsPaidUser）。
+	paidMu    sync.RWMutex
+	paidByUID map[string]bool
 
 	// globalModels 缓存 global 模型名目录探测结果（成功 ∩ 静态 overlay；
 	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
@@ -844,6 +878,10 @@ type Client struct {
 	// creditObserver 余额查询观察者（见 CreditObserver / SetCreditObserver）。
 	// atomic：启动期挂载、运行期并发读，不参与任何出站决策。
 	creditObserver atomic.Pointer[CreditObserver]
+
+	// TLSFingerprint 出站 TLS ClientHello 指纹档位（"" / "node" 复刻官方 / "go" 原生）。
+	TLSFingerprint string
+	dialer         *net.Dialer
 }
 
 // CreditObserver 余额查询观察者：每次**真实查到**余额后回调（uid + 余额绝对值）。
@@ -856,13 +894,16 @@ type CreditObserver func(uid string, credits int64)
 // TLS 握手超时 / 短 keepalive 探测 / 失败清池，参数见 transport.go——吸收上游
 // kongjianguan 4 连击实测经验）。
 func New() *Client {
-	tr := newTransport()
+	d := newDialer()
+	tr := newTransportWithDialer(d)
 	c := &Client{
-		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
-		ChatBaseCN:    "https://copilot.tencent.com",
-		BillingBaseCN: "https://www.codebuddy.cn",
-		WebBaseCN:     "https://www.workbuddy.cn",
+		HTTP:           &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		ChatHTTP:       &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		TLSFingerprint: TLSFingerprintNode,
+		dialer:         d,
+		ChatBaseCN:     "https://copilot.tencent.com",
+		BillingBaseCN:  "https://www.codebuddy.cn",
+		WebBaseCN:      "https://www.workbuddy.cn",
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
 		GlobalEnabled: true,
@@ -955,13 +996,14 @@ func (c *Client) chatBase(a *auth.Auth) string {
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
 func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
+	maxOut := c.modelMaxOutSnapshot(realm)
 	if realmKey(realm) == "global" {
 		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（全局 21 名内档位如
 		// deepseek-v4.1-flash ['high']）。当前探测桶为空时也按静态表降级，不全程透传
 		//（issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
 		efforts, defs = globalEffortMap(efforts, defs)
 	}
-	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints.Load(), efforts, defs)
+	body = PrepareBodyOptWithEffortsDefaultAndCaps(body, c.SanitizeFingerprints.Load(), efforts, defs, maxOut)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
@@ -1263,6 +1305,24 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128；
 // #119 后 global 出站固定 /v2，该兜底保留——上游对 /v2 是否需要 system 无实测
 // 反证，删了无回滚路径）。
+const gzipMinChatBody = 1024
+
+func gzipBody(src []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := zw.Write(src); err != nil {
+		zw.Close()
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1280,11 +1340,21 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
 	for _, path := range c.chatPaths(a) {
 		endpoint := c.chatBase(a) + path
-		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(prepared))
+		outBody := prepared
+		gzipped := false
+		if len(outBody) >= gzipMinChatBody && os.Getenv("WB2A_NO_CHAT_GZIP") != "1" {
+			if z, zerr := gzipBody(outBody); zerr == nil {
+				outBody, gzipped = z, true
+			}
+		}
+		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(outBody))
 		if err != nil {
 			return nil, 0, nil, err
 		}
 		c.ChatHeaders(req, a, clientIP, meta)
+		if gzipped {
+			req.Header.Set("Content-Encoding", "gzip")
+		}
 		// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)
@@ -1311,7 +1381,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			}
 			kind := Classify(resp.StatusCode, string(raw))
 			log.Printf("WARN: [upstream] chat_stream acct=%s: upstream %d %s body=%s",
-				logfmt.Label(a.UID, a.Nickname), resp.StatusCode, kind, truncate(string(raw), 200))
+				logfmt.Label(a.UID, a.Nickname), resp.StatusCode, kind, truncate(string(raw), 512))
 			// ≥400 直接返回（#119 后 global 单路径 /v2，chat 层无 fallback 链）。
 			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析）：
 			// ErrNone 是防御分支（≥400 不应产生 None），返回原文让 handler 兜底。
@@ -1321,6 +1391,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			ue := &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
 			if d, ok := ParseRetryAfter(resp.Header); ok {
 				ue.RetryAfter = d
+			} else if kind == ErrUpstreamBusy {
+				// 6020 排队信封的等待口径在 body（data.retry_after），头缺失时从 body 抽取。
+				if d, ok := parseQueueRetryAfter(raw); ok {
+					ue.RetryAfter = d
+				}
 			}
 			return nil, resp.StatusCode, raw, ue
 		}
@@ -1366,6 +1441,10 @@ type ModelInfo struct {
 	PromoCredits string   // 折扣后倍率原文（如 "0x" / "0.50x"），仅展示
 	PromoLabel   string   // 徽章文案（限时免费 / 夜间折扣 / 错峰使用）
 	PromoNote    string   // hover 说明原文（含时段/日期描述）
+
+	// 付费层级（modelTiers）：Tier 供展示；Exclusive 仅 accessMode=exclusive 为 true。
+	Tier      string
+	Exclusive bool
 }
 
 // dynModelEntry 上游模型目录（CN /console 与 global /v2 同构）的单条模型解析形态，
@@ -1514,6 +1593,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
 	c.storeModelRates(a.Realm(), out)
+	c.storeModelMaxOut(a.Realm(), out)
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入桶）。
 	// 空桶时跳过写：避免「某探测无档位数据」清掉既有桶。
 	cache := make(map[string][]string, len(out))
@@ -1859,13 +1939,64 @@ func effectiveModelRate(mi ModelInfo) string {
 	return normalizeModelRate(mi.Credits)
 }
 
+type v3ModelTier struct {
+	Enabled    bool     `json:"enabled"`
+	Priority   int      `json:"priority"`
+	ModelIDs   []string `json:"modelIds"`
+	AccessMode string   `json:"accessMode"`
+	Badge      *struct {
+		Label string `json:"label"`
+	} `json:"badge"`
+}
+
+var proOnlyFallback = []string{"primary-model"}
+
+// applyModelTiers 给受限模型挂付费层级文案与 AccessMode=exclusive 门控标记（同模型取高优先级）。
+func applyModelTiers(out map[string]ModelInfo, tiers []v3ModelTier) {
+	if len(out) == 0 {
+		return
+	}
+	best := map[string]int{}
+	for _, t := range tiers {
+		if !t.Enabled || t.Badge == nil || strings.TrimSpace(t.Badge.Label) == "" {
+			continue
+		}
+		for _, id := range t.ModelIDs {
+			mi, ok := out[id]
+			if !ok {
+				continue
+			}
+			if p, seen := best[id]; seen && p >= t.Priority {
+				continue
+			}
+			best[id] = t.Priority
+			mi.Tier = t.Badge.Label
+			if strings.EqualFold(strings.TrimSpace(t.AccessMode), "exclusive") {
+				mi.Exclusive = true
+			}
+			out[id] = mi
+		}
+	}
+	for _, id := range proOnlyFallback {
+		if mi, ok := out[id]; ok && mi.Tier == "" {
+			mi.Tier = "Pro Only"
+			mi.Exclusive = true
+			out[id] = mi
+		}
+	}
+}
+
 // storeModelRates 按 realm 整体替换模型倍率快照。目录成功刷新但没有可解析
 // 倍率时写入空桶，使旧倍率不会继续冒充当前价。
 func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 	rates := make(map[string]string, len(infos))
+	excl := make(map[string]bool)
 	for _, mi := range infos {
 		if mi.ID == "" {
 			continue
+		}
+		if mi.Exclusive {
+			excl[mi.ID] = true
 		}
 		if rate := effectiveModelRate(mi); rate != "" {
 			rates[mi.ID] = rate
@@ -1876,7 +2007,84 @@ func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 	if c.modelRates == nil {
 		c.modelRates = make(map[string]map[string]string)
 	}
+	if c.exclusive == nil {
+		c.exclusive = make(map[string]map[string]bool)
+	}
 	c.modelRates[realmKey(realm)] = rates
+	c.exclusive[realmKey(realm)] = excl
+}
+
+// ModelExclusive 报告 (域, 模型) 是否为免费号不可调用的 exclusive 模型；未知返回 false。
+func (c *Client) ModelExclusive(realm, model string) bool {
+	if c == nil || model == "" {
+		return false
+	}
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	return c.exclusive[realmKey(realm)][model]
+}
+
+// NotePaidUser 记录账号是否为付费号（仅在收到明确的 IsPaidUser 字段时调用）。
+func (c *Client) NotePaidUser(uid string, paid bool) {
+	if c == nil || uid == "" {
+		return
+	}
+	c.paidMu.Lock()
+	defer c.paidMu.Unlock()
+	if c.paidByUID == nil {
+		c.paidByUID = make(map[string]bool)
+	}
+	c.paidByUID[uid] = paid
+}
+
+// PaidUser 返回观测过的付费状态；第二个返回值 known=false 表示未知（不等同免费）。
+func (c *Client) PaidUser(uid string) (paid, known bool) {
+	if c == nil {
+		return false, false
+	}
+	c.paidMu.RLock()
+	defer c.paidMu.RUnlock()
+	paid, known = c.paidByUID[uid]
+	return paid, known
+}
+
+// storeModelMaxOut 按 realm 整体替换模型输出上限快照（maxOutputTokens）。
+func (c *Client) storeModelMaxOut(realm string, infos []ModelInfo) {
+	m := make(map[string]int64, len(infos))
+	for _, mi := range infos {
+		if mi.ID != "" && mi.MaxTokens > 0 {
+			m[mi.ID] = mi.MaxTokens
+		}
+	}
+	c.effortsMu.Lock()
+	defer c.effortsMu.Unlock()
+	if c.modelMaxOut == nil {
+		c.modelMaxOut = make(map[string]map[string]int64)
+	}
+	c.modelMaxOut[realmKey(realm)] = m
+}
+
+// StoreModelMaxOutForTest 跨包测试钩子：直接写入某域的模型输出上限快照。
+func (c *Client) StoreModelMaxOutForTest(realm string, maxOut map[string]int64) {
+	infos := make([]ModelInfo, 0, len(maxOut))
+	for id, n := range maxOut {
+		infos = append(infos, ModelInfo{ID: id, MaxTokens: n})
+	}
+	c.storeModelMaxOut(realm, infos)
+}
+
+func (c *Client) modelMaxOutSnapshot(realm string) map[string]int64 {
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	bucket := c.modelMaxOut[realmKey(realm)]
+	if len(bucket) == 0 {
+		return nil
+	}
+	cp := make(map[string]int64, len(bucket))
+	for k, v := range bucket {
+		cp[k] = v
+	}
+	return cp
 }
 
 // ModelRate 返回最近成功刷新的指定域模型生效倍率；未知返回空串。
@@ -1966,6 +2174,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 				} `json:"ModelTrialBanner"`
 			} `json:"productFeaturesConfig"`
 			ModelPromotions []v3ModelPromotion `json:"modelPromotions"`
+			ModelTiers      []v3ModelTier      `json:"modelTiers"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -2014,6 +2223,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	// 倍率，如 hy4-preview-f 的 x0.29），而 WorkBuddy 客户端显示的是生效价（试用/
 	// 折扣窗口内 factor 打折）——面板据此展示「生效价 + 标签 + 牌价」。
 	applyModelPromotions(out, env.Data.ModelPromotions)
+	applyModelTiers(out, env.Data.ModelTiers)
 
 	if len(out) == 0 {
 		return nil, fmt.Errorf("v3/config returned empty models")
@@ -2353,6 +2563,14 @@ func (c *Client) UserResourceSnapshot(a *auth.Auth, soon time.Duration) (remain,
 		}
 		c.notifyCredits(a, remain, err)
 		return
+	}
+	if c.globalOn(a) {
+		rm, tt, ex, ea, er, bk, gerr := c.globalUserResource(a, soon)
+		if gerr == nil {
+			return rm, tt, ex, ea, er, bk, nil
+		}
+		log.Printf("WARN: billing %s: global summary 失败，回落个人资源包路径: %v",
+			logfmt.Label(a.UID, a.Nickname), gerr)
 	}
 	now := time.Now()
 	body := map[string]any{

@@ -2,9 +2,15 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/loginsite"
 )
 
 // TestParseRealmArgs 覆盖 --realm 参数解析：缺省 cn、等号/分离式写法、
@@ -165,5 +171,88 @@ func TestBuildLoginOutputRealmAlwaysSet(t *testing.T) {
 				t.Errorf("realm=%q want %q", m, c.wantRealm)
 			}
 		})
+	}
+}
+
+func TestParseSiteArgs(t *testing.T) {
+	s, rest, err := parseSiteArgs([]string{"--site=intl", "--realm=cn", "url"})
+	if err != nil {
+		t.Fatalf("parseSiteArgs err=%v", err)
+	}
+	if s.ID != loginsite.SiteIntl || len(rest) != 1 || rest[0] != "url" {
+		t.Errorf("got site=%s rest=%v want intl [url]", s.ID, rest)
+	}
+	s, rest, err = parseSiteArgs([]string{"--realm=global", "poll"})
+	if err != nil {
+		t.Fatalf("parseSiteArgs err=%v", err)
+	}
+	if s.ID != loginsite.SiteWorkBuddy || s.Realm != loginsite.RealmGlobal || rest[0] != "poll" {
+		t.Errorf("got site=%s realm=%s rest=%v want workbuddy global", s.ID, s.Realm, rest)
+	}
+}
+
+func TestRunURLAndPollDesktopHeaders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Origin") != "" || r.Header.Get("Referer") != "" || r.Header.Get("X-Requested-With") != "" {
+			t.Errorf("%s unexpected browser headers: %+v", r.URL.Path, r.Header)
+		}
+		if !strings.HasPrefix(r.Header.Get("User-Agent"), "WorkBuddy/") {
+			t.Errorf("%s User-Agent=%q want WorkBuddy/...", r.URL.Path, r.Header.Get("User-Agent"))
+		}
+		switch r.URL.Path {
+		case "/v2/plugin/auth/state":
+			if r.URL.Query().Get("platform") != "workbuddy" {
+				t.Errorf("platform=%q want workbuddy", r.URL.Query().Get("platform"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0,
+				"data": map[string]string{
+					"state":   "st-cli-1",
+					"authUrl": "https://www.workbuddy.cn/login?platform=workbuddy&state=st-cli-1",
+				},
+			})
+		case "/v2/plugin/auth/token":
+			if r.Header.Get("X-Domain") != "" {
+				t.Errorf("auth/token should omit X-Domain, got %q", r.Header.Get("X-Domain"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0,
+				"data": map[string]any{
+					"accessToken":  "at-cli",
+					"refreshToken": "rt-cli",
+					"expiresIn":    3600,
+					"domain":       "www.codebuddy.cn",
+				},
+			})
+		case "/v2/plugin/login/account":
+			if r.Header.Get("Authorization") != "Bearer at-cli" || r.Header.Get("X-Domain") != "www.workbuddy.cn" {
+				t.Errorf("login/account header mismatch: %+v", r.Header)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0,
+				"data": map[string]string{
+					"uid":          "u-cli-1",
+					"enterpriseId": "",
+					"nickname":     "nick",
+				},
+			})
+		}
+	}))
+	defer srv.Close()
+
+	site := loginsite.For(loginsite.SiteCN)
+	site.API = srv.URL
+	statePath := filepath.Join(t.TempDir(), "state.json")
+
+	var urlOut bytes.Buffer
+	runURL(site, statePath, srv.Client(), &urlOut)
+	if !strings.Contains(urlOut.String(), "loginSessionId=") || !strings.Contains(urlOut.String(), "version="+loginsite.ClientVersionWorkBuddyCN) {
+		t.Errorf("decorated url missing params: %s", urlOut.String())
+	}
+
+	var pollOut bytes.Buffer
+	runPoll(site, statePath, srv.Client(), &pollOut)
+	if !strings.Contains(pollOut.String(), `"access_token":"at-cli"`) || !strings.Contains(pollOut.String(), `"realm":"cn"`) {
+		t.Errorf("poll output mismatch: %s", pollOut.String())
 	}
 }

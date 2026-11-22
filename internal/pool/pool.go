@@ -54,6 +54,10 @@ type Pool struct {
 	// 循环依赖与分层破坏），nil 时倍率兜底不生效（退化为仅本地台账判定）。
 	// 仅在持 p.mu 时由 floorBlockedForModel 调用；回调不得反向调用 Pool 方法。
 	modelRateOf func(realm, model string) string
+	// exclusiveModelOf / exclusivePaidOf 「免费号调不通」模型（modelTiers accessMode=exclusive）
+	// 预过滤查表与账号付费状态查表（main 由 upstream 注入；未观测或任一为 nil 时放行）。
+	exclusiveModelOf func(realm, model string) bool
+	exclusivePaidOf  func(uid string) (paid, known bool)
 	// 加权路由的闲置补偿调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
@@ -82,6 +86,8 @@ type Pool struct {
 	strategies   RegionStrategies
 	accountOrder RegionAccountOrder
 	scheduling   map[string]scheduleCursor
+	// egress 出口级瞬时失败计数（egress.go，运行态，不持久化）。
+	egress map[string]egressStat
 	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
 	stopCh chan struct{}
@@ -259,6 +265,14 @@ func (p *Pool) SetModelRateOf(fn func(realm, model string) string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.modelRateOf = fn
+}
+
+// SetExclusiveModels 注入「免费号调不通」的模型查表与账号付费状态查表。两者任一为 nil 即关闭闸门。
+func (p *Pool) SetExclusiveModels(modelOf func(realm, model string) bool, paidOf func(uid string) (bool, bool)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.exclusiveModelOf = modelOf
+	p.exclusivePaidOf = paidOf
 }
 
 // SetMaxInFlight 注入单账号最大在途请求数；0 = 不限。负值保留原值。

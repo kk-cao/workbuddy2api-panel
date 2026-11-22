@@ -800,9 +800,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// every client on that account ends up sharing a single, constantly evicted
 	// prefix-cache slot.
 	convID := session.ResolveConversationID(body)
+	cacheKey := sessKey
+	if cacheKey == "" {
+		cacheKey = session.DeriveCacheKey(body)
+	}
+	rootID := ""
+	if cacheKey != "" {
+		rootID = session.RequestIDForKey("root:" + cacheKey)
+	}
 	chatMeta := upstream.ChatMeta{
 		ConversationID: convID,
-		CacheKeyID:     sessKey,
+		CacheKeyID:     cacheKey,
+		RootRequestID:  rootID,
+		AgentType:      upstream.AgentTypeMain,
 	}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
@@ -822,6 +832,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
 	skipRealm := ""
+	var queueWaited bool
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
@@ -972,17 +983,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					logfmt.Label(acct.UID, acct.Nickname), terr)
 				break
 			}
-			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
-			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
-			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
-			// 上游 client 已打 transport error 日志。
+			// 传输层失败：若客户端已取消直接终止；否则记到出口（不记单个账号连败，避免
+			// 短暂链路抖动把恰好选中的健康号逐个降权），按出口连续失败做秒级指数退避，
+			// 连续失败达到 egressGiveUpStreak 后放弃本轮换号直接返回 503。
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
-			h.cfg.Pool.NoteFailures(acct.UID)
+			if r.Context().Err() != nil {
+				fail(acct.UID)
+				break
+			}
+			streak := h.cfg.Pool.NoteEgressFailure(egressKey(acct), time.Now())
 			fail(acct.UID)
-			if !rotateBackoff(i, r.Context()) {
-				break // ctx 取消：终止轮转（传输层错误换号退避）
+			if streak >= egressGiveUpStreak {
+				break
+			}
+			if !sleepCtx(r.Context(), egressBackoff(streak, egressBackoffBase)) {
+				break
 			}
 			continue
 		}
@@ -1076,13 +1093,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
-			// 6021「queue.full.title」渠道级容量满载：**不罚号不轮转**，立即透传
-			// 上游原文回客户端（503 + upstream_busy）。上游集群排队打满时换任何
-			// 账号都撞同一堵墙——按限流处置会逐号软冷却，实测 2 秒绞杀整池健康号
-			// （2026-10-15 实案），且换号白撞把无效请求放大 MaxRotate 倍。客户端
-			// 按 SDK 退避重试即可；等待窗口过去渠道恢复即成功。
+			// 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/容量满载：
+			// 不罚号，带 retry_after（6020）时先释放并发槽位（保留粘性绑定）并有界等一轮同号重试，
+			// 无 retry_after（6021）或重试后仍撞排队则直接透传 503 + upstream_busy。
 			if kind == upstream.ErrUpstreamBusy {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				if !queueWaited && busyWaitMax > 0 && uerr != nil && uerr.RetryAfter > 0 {
+					releaseHeld()
+					d := uerr.RetryAfter
+					if d > busyWaitMax {
+						d = busyWaitMax
+					}
+					log.Printf("queue-wait: model=%s realm=%q upstream 6020 queued (retry_after=%s), waiting %s then retry once",
+						bareModel, realm, uerr.RetryAfter.Round(time.Millisecond), d.Round(time.Millisecond))
+					if !sleepCtx(r.Context(), d) {
+						lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+						break
+					}
+					queueWaited = true
+					delete(tried, acct.UID)
+					i--
+					continue
+				}
 				fail(acct.UID)
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
@@ -1745,4 +1777,12 @@ func (h *Handler) hintOf(kind upstream.ErrKind, body, bareModel string, hasImage
 		msg = uerr.Msg
 	}
 	return upstream.GatewayHint(kind, msg, h.hintContext(bareModel, hasImage))
+}
+
+// egressKey 归因直连传输层失败到按 realm 隔离的出口标识。
+func egressKey(a *auth.Auth) string {
+	if a != nil && a.IsGlobal() {
+		return "direct:global"
+	}
+	return "direct:cn"
 }

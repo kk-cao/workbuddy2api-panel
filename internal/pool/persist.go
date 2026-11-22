@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/safefile"
 )
 
 var flushInterval = 5 * time.Second
@@ -118,7 +119,7 @@ func (p *Pool) Flush() {
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
 func (p *Pool) load() {
-	raw, err := os.ReadFile(p.stateFp)
+	raw, err := safefile.Read(p.stateFp, nil)
 	if err != nil {
 		return
 	}
@@ -250,12 +251,7 @@ func (p *Pool) saveLocked() {
 	if dir := filepath.Dir(p.stateFp); dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
 	}
-	tmp := p.stateFp + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		p.notePersistFail(err)
-		return
-	}
-	if err := os.Rename(tmp, p.stateFp); err != nil {
+	if err := safefile.WriteKeep(p.stateFp, raw, 0o600); err != nil {
 		p.notePersistFail(err)
 		return
 	}

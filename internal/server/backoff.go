@@ -18,9 +18,40 @@ const (
 	// rotateBackoffCap 轮转退避封顶（报告 P0-2 建议 8s：轮转上限默认 3 次，
 	// 实际等待序列 500ms/1s，封顶只约束极端配置下的 MaxRotate）。
 	rotateBackoffCap = 8 * time.Second
+	// egressBackoffCap 出口级传输失败退避封顶（秒级，防 2^n 溢出）。
+	egressBackoffCap = 15 * time.Second
+	// egressGiveUpStreak 同一出口连续传输失败达此阈值时放弃继续换号重试。
+	egressGiveUpStreak = 5
 	// jitterFraction 抖动比例（±25%，对齐 intl CLI delay×(1±0.25) 形态）。
 	jitterFraction = 0.25
 )
+
+var (
+	// egressBackoffBase 出口级退避基数（TestMain 中置 0，单测退避阶梯时显式传入 time.Second）。
+	egressBackoffBase = time.Second
+	// busyWaitMax 6020 排队等待上限（单测可临时覆盖以加速）。
+	busyWaitMax = 60 * time.Second
+)
+
+// egressBackoff 计算出口级第 streak 次（1 基）传输失败的退避时长：base·2^(streak-1)
+// 封顶 egressBackoffCap 并施加 ±25% 抖动；streak<=0 或 base<=0 返回 0。
+func egressBackoff(streak int, base time.Duration) time.Duration {
+	if streak <= 0 || base <= 0 {
+		return 0
+	}
+	d := base
+	for k := 1; k < streak && d < egressBackoffCap; k++ {
+		if d > egressBackoffCap/2 {
+			d = egressBackoffCap
+			break
+		}
+		d *= 2
+	}
+	if d > egressBackoffCap {
+		d = egressBackoffCap
+	}
+	return jitterDur(d)
+}
 
 // jitterDur 给时长施加 ±jitterFraction 的均匀抖动，返回 [d·(1-f), d·(1+f)] 区间值。
 // d<=0 原样返回（零等待不抖动）。抖动目的是打散多请求同相位重试（WAF 频控按
