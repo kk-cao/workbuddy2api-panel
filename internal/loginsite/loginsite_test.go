@@ -213,7 +213,7 @@ func TestClientUA(t *testing.T) {
 	if ClientUA != "CLI/"+ClientVersion+" CodeBuddy/"+ClientVersion {
 		t.Errorf("ClientUA=%q mismatch", ClientUA)
 	}
-	if ClientVersionWorkBuddyGL != "5.11.4" || ClientVersionBuiltinCLIGL != "2.176.0" {
+	if ClientVersionWorkBuddyGL != "5.11.7" || ClientVersionBuiltinCLIGL != "2.176.0" {
 		t.Errorf("GL versions mismatch: %s / %s", ClientVersionWorkBuddyGL, ClientVersionBuiltinCLIGL)
 	}
 }

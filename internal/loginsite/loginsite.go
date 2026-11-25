@@ -19,13 +19,13 @@ import (
 const ClientVersion = "2.176.0"
 
 // ClientUA 未复核站点的兜底 User-Agent（CodeBuddy CLI 家族形态）。
-// WorkBuddy 桌面端（CN 5.11.3 / Global 5.11.4）设备码三端点发桌面端 RPC 族 UA，见 Site.UserAgent。
+// WorkBuddy 桌面端（CN 5.11.3 / Global 5.11.7）设备码三端点发桌面端 RPC 族 UA，见 Site.UserAgent。
 const ClientUA = "CLI/" + ClientVersion + " CodeBuddy/" + ClientVersion
 
-// WorkBuddy 桌面端版本与内置 CLI 版本（真机 UA 段，保留本仓已验证的 5.11.4 / 2.176.0 国际版口径）。
+// WorkBuddy 桌面端版本与内置 CLI 版本（真机 UA 段，保留本仓已验证的 5.11.7 / 2.176.0 国际版口径）。
 const (
 	ClientVersionWorkBuddyCN  = "5.11.3"
-	ClientVersionWorkBuddyGL  = "5.11.4"
+	ClientVersionWorkBuddyGL  = "5.11.7"
 	ClientVersionBuiltinCLICN = "2.176.0"
 	ClientVersionBuiltinCLIGL = "2.176.0"
 )

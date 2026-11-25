@@ -45,8 +45,8 @@ const (
 
 	desktopCommitCN        = "ecace0f7028166695994300182295329b8b95449"
 	desktopReleaseDateCN   = int64(1794502169764)
-	desktopCommitGlobal    = "0026dff06ce8414140e6f2fa731049855c3ecc6f"
-	desktopReleaseDateIntl = int64(1794817062903)
+	desktopCommitGlobal    = "525fde106956c7265f8b4d8d93aadd139915588b"
+	desktopReleaseDateIntl = int64(1795618165629)
 )
 
 // desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase。

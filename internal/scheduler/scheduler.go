@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -66,6 +67,14 @@ type Config struct {
 	// 的任务奖励领掉，不跑任何行为链路）。与 GrowthHook 同款延迟挂载；nil 时
 	// ticker 到点跳过。见 issue #174：成长队列与「一键完成」都不负责这条补领链路。
 	TaskSweepHook func()
+
+	// JitterMinutes 名义整点之后的确定性偏移窗口（分钟，0=精确整点，上限 59）。
+	// 不同任务族按 FNV(kind|日|小时) 错开在不同分钟启动，避免多任务与全网整点脉冲撞 429。
+	JitterMinutes int
+	// AccountSpreadMinutes 账号级摊开窗口（分钟，0=关闭）：排程触发的遍历任务在窗口内按账号错峰。
+	AccountSpreadMinutes int
+	// AccountSpreadMinGapSeconds 账号摊开时相邻两账号的最小间隔秒数（0=仅随机偏移）。
+	AccountSpreadMinGapSeconds int
 }
 
 // Scheduler 调度器。
@@ -88,6 +97,10 @@ type Scheduler struct {
 	rearmSchedule chan struct{}
 	rearmBalance  chan struct{}
 	rearmSweep    chan struct{}
+
+	// spreadRunning 账号摊开启用时各任务族的在途占位标记（实例级），防止上一批尚未跑完时
+	// 下一个时点再次拉起同类任务叠加并发。
+	spreadRunning [taskKindCount]atomic.Bool
 
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
@@ -178,6 +191,31 @@ func (s *Scheduler) SetIncludeDisabledInTasks(v bool) {
 	s.schedMu.Unlock()
 }
 
+// SetJitterAndSpread 热更新整点抖动与账号摊开参数；jitter 变更时立即重算下一次唤醒。
+func (s *Scheduler) SetJitterAndSpread(jitterMinutes, spreadMinutes, spreadMinGapSeconds int) {
+	if jitterMinutes < 0 {
+		jitterMinutes = 0
+	}
+	if jitterMinutes > 59 {
+		jitterMinutes = 59
+	}
+	if spreadMinutes < 0 {
+		spreadMinutes = 0
+	}
+	if spreadMinGapSeconds < 0 {
+		spreadMinGapSeconds = 0
+	}
+	s.schedMu.Lock()
+	jitterChanged := s.cfg.JitterMinutes != jitterMinutes
+	s.cfg.JitterMinutes = jitterMinutes
+	s.cfg.AccountSpreadMinutes = spreadMinutes
+	s.cfg.AccountSpreadMinGapSeconds = spreadMinGapSeconds
+	s.schedMu.Unlock()
+	if jitterChanged {
+		poke(s.rearmSchedule)
+	}
+}
+
 func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours, growthHours []int,
 	checkinDisabled, travelDisabled, activityDisabled, keepaliveDisabled, blackcatDisabled, growthDisabled bool) {
 	s.schedMu.Lock()
@@ -220,14 +258,39 @@ func poke(ch chan struct{}) {
 
 // nextFire 返回 now 之后最近的一个整点触发时间；hours 为本地小时（0-23）。
 func nextFire(now time.Time, hours []int) time.Time {
+	return nextFireKind(now, hours, taskCheckin, 0)
+}
+
+// jitterOffset 同一任务族、同一天、同一小时返回确定性偏移（[0, jitterMinutes*60) 秒）。
+// 使用 FNV 而非 math/rand：nextWake 每轮重算，同一小时内偏移必须稳定以免重复触发。
+func jitterOffset(kind taskKind, nominal time.Time, jitterMinutes int) time.Duration {
+	if jitterMinutes <= 0 {
+		return 0
+	}
+	if jitterMinutes > 59 {
+		jitterMinutes = 59
+	}
+	secs := int64(jitterMinutes) * 60
+	h := fnv.New32a()
+	_, _ = fmt.Fprintf(h, "%s|%s", kind, nominal.Format("2006-01-02T15"))
+	return time.Duration(int64(h.Sum32())%secs) * time.Second
+}
+
+// nextFireKind 返回 now 之后最近的一个（名义整点 + 确定性抖动偏移）触发时间。
+// jitterMinutes 上限 59，保证偏移绝不跨小时，只需检查今明两日（d=0,1）。
+func nextFireKind(now time.Time, hours []int, kind taskKind, jitterMinutes int) time.Time {
 	var earliest time.Time
 	for _, h := range hours {
-		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
-		if !t.After(now) {
-			t = t.Add(24 * time.Hour)
-		}
-		if earliest.IsZero() || t.Before(earliest) {
-			earliest = t
+		for d := 0; d < 2; d++ {
+			nominal := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location()).AddDate(0, 0, d)
+			t := nominal.Add(jitterOffset(kind, nominal, jitterMinutes))
+			if !t.After(now) {
+				continue
+			}
+			if earliest.IsZero() || t.Before(earliest) {
+				earliest = t
+			}
+			break
 		}
 	}
 	return earliest
@@ -243,11 +306,32 @@ const (
 	taskKeepalive
 	taskBlackcat
 	taskGrowth
+	taskKindCount
 )
 
+func (k taskKind) String() string {
+	switch k {
+	case taskCheckin:
+		return "checkin"
+	case taskTravel:
+		return "travel"
+	case taskActivity:
+		return "activity"
+	case taskKeepalive:
+		return "keepalive"
+	case taskBlackcat:
+		return "blackcat"
+	case taskGrowth:
+		return "growth"
+	default:
+		return "task"
+	}
+}
+
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
-// 多类任务若配到同一小时（如签到与旅行都含 9），该时刻多类任务需一并执行。
-// 已显式禁用的任务不进候选（nextFire 对其零值返回零时间，nextWake 再跳过零时点）。
+// 多类任务若配到同一小时（如签到与旅行都含 9），jitterMinutes=0 时同刻触发，
+// jitterMinutes>0 时按任务族各自哈希错开在不同分钟启动。
+// 已显式禁用的任务不进候选（nextFireKind 对其零值返回零时间，nextWake 再跳过零时点）。
 // 排程参数在 schedMu 下快照，与 Reconfigure 的并发写隔离。
 func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	s.schedMu.Lock()
@@ -256,6 +340,7 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	checkinOff, keepaliveOff, blackcatOff := s.cfg.CheckinDisabled, s.cfg.KeepaliveDisabled, s.cfg.BlackcatDisabled
 	growthHours, growthOff := s.cfg.GrowthHours, s.cfg.GrowthDisabled
 	travelOff, activityOff := s.cfg.TravelDisabled, s.cfg.ActivityDisabled
+	jitter := s.cfg.JitterMinutes
 	s.schedMu.Unlock()
 
 	type slot struct {
@@ -264,22 +349,22 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	var slots []slot
 	if !checkinOff {
-		slots = append(slots, slot{nextFire(now, checkinHours), taskCheckin})
+		slots = append(slots, slot{nextFireKind(now, checkinHours, taskCheckin, jitter), taskCheckin})
 	}
 	if !travelOff {
-		slots = append(slots, slot{nextFire(now, travelHours), taskTravel})
+		slots = append(slots, slot{nextFireKind(now, travelHours, taskTravel, jitter), taskTravel})
 	}
 	if !activityOff {
-		slots = append(slots, slot{nextFire(now, activityHours), taskActivity})
+		slots = append(slots, slot{nextFireKind(now, activityHours, taskActivity, jitter), taskActivity})
 	}
 	if !keepaliveOff {
-		slots = append(slots, slot{nextFire(now, keepaliveHours), taskKeepalive})
+		slots = append(slots, slot{nextFireKind(now, keepaliveHours, taskKeepalive, jitter), taskKeepalive})
 	}
 	if !blackcatOff {
-		slots = append(slots, slot{nextFire(now, blackcatHours), taskBlackcat})
+		slots = append(slots, slot{nextFireKind(now, blackcatHours, taskBlackcat, jitter), taskBlackcat})
 	}
 	if !growthOff {
-		slots = append(slots, slot{nextFire(now, growthHours), taskGrowth})
+		slots = append(slots, slot{nextFireKind(now, growthHours, taskGrowth, jitter), taskGrowth})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -412,25 +497,34 @@ func (s *Scheduler) Run(ctx context.Context) {
 	}
 }
 
-// runBatch 并行派发一批任务（同一唤醒时刻的多类任务），等全部完成返回。
-// ctx 取消时由各任务内部的可取消等待快速收尾。
+// runBatch 并行派发一批任务（同一唤醒时刻的多类任务）。
+// 未启用账号摊开时等全部任务完成返回；启用账号摊开时异步派发（避免摊开窗口阻塞后续
+// 错开在几分钟后的其他任务族），并靠 spreadRunning 防止同类任务重入叠加。
 func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
+	spread := s.spreadEnabled()
 	var wg sync.WaitGroup
 	for _, k := range kinds {
+		if spread && k < taskKindCount && !s.spreadRunning[k].CompareAndSwap(false, true) {
+			log.Printf("spread: %s 上一批尚未收尾，跳过本时点", k)
+			continue
+		}
 		wg.Add(1)
 		go func(k taskKind) {
 			defer wg.Done()
+			if spread && k < taskKindCount {
+				defer s.spreadRunning[k].Store(false)
+			}
 			switch k {
 			case taskCheckin:
-				s.RunCheckinNow()
+				s.runCheckin(ctx, spread)
 			case taskTravel:
-				s.RunTravelNow()
+				s.runTravel(ctx, spread)
 			case taskActivity:
-				s.runActivity(ctx)
+				s.runActivity(ctx, spread)
 			case taskKeepalive:
-				s.RunKeepaliveNow()
+				s.runKeepalive(ctx, spread)
 			case taskBlackcat:
-				s.RunBlackcatNow()
+				s.runBlackcat(ctx, spread)
 			case taskGrowth:
 				// 成长任务队列：回调在 panel 侧异步启动（返回不等执行完），nil 未挂载则跳过。
 				s.schedMu.Lock()
@@ -442,7 +536,9 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 			}
 		}(k)
 	}
-	wg.Wait()
+	if !spread {
+		wg.Wait()
+	}
 }
 
 // sleepCtx 可取消的等待：ctx 取消立即返回 false（优雅停机不必等限速睡醒），
@@ -468,15 +564,24 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
 func (s *Scheduler) RunCheckinNow() {
+	s.runCheckin(context.Background(), false)
+}
+
+// runCheckin 签到遍历。spread=true（排程路径）时按账号级偏移错开，CN 与 global 均参与错峰。
+func (s *Scheduler) runCheckin(ctx context.Context, spread bool) {
+	plan := s.spreadPlan(taskCheckin, spread, time.Now())
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range plan.order(s.cfg.Pool.List()) {
 		if st.Disabled && !includeDisabled {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
+		}
+		if !plan.wait(ctx, st.UID) {
+			return
 		}
 		// global realm：先只读查询签到活动状态，仅 active 且当天未签时才发写请求；
 		// 末尾不 continue，与企业版同口径继续走下方余额快照更新与自动解冻闭环。
@@ -516,7 +621,7 @@ func (s *Scheduler) RunCheckinNow() {
 			ExpiryBuckets:     poolExpiryBuckets(buckets),
 		})
 	}
-	s.RunStreakBonusNow()
+	s.runStreakBonus(ctx, spread)
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
@@ -529,14 +634,15 @@ func (s *Scheduler) RunCheckinNow() {
 // RunActivityNow 是无 ctx 的外部入口（面板/测试一次性触发）；排程主循环走
 // runActivity（ctx 取消时立即放弃剩余账号，不等限速睡满）。
 func (s *Scheduler) RunActivityNow() {
-	s.runActivity(context.Background())
+	s.runActivity(context.Background(), false)
 }
 
 // runActivity 活跃上报遍历，随 ctx 取消立即退出。
-func (s *Scheduler) runActivity(ctx context.Context) {
+func (s *Scheduler) runActivity(ctx context.Context, spread bool) {
+	plan := s.spreadPlan(taskActivity, spread, time.Now())
 	first := true
 	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range plan.order(s.cfg.Pool.List()) {
 		if st.Disabled && !includeDisabled {
 			continue
 		}
@@ -558,7 +664,11 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		// 无需改动 upstream。此处曾按「D4 门控：global 无活跃体系」跳过 global，实测该
 		// 判断不成立——国际版 /v2/report 可用，跳过即国际版账号永远点不亮连登（上游
 		// a190252 同口径修复）。checkin/travel 的 global 门控不受影响，仍跳过。
-		if !first {
+		if plan != nil {
+			if !plan.wait(ctx, st.UID) {
+				return
+			}
+		} else if !first {
 			if !sleepCtx(ctx, activityAccountDelay) {
 				return // 优雅停机：不等限速睡满，剩余账号下轮再报
 			}
@@ -602,14 +712,23 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
+	s.runKeepalive(context.Background(), false)
+}
+
+// runKeepalive 保活遍历。spread=true（排程路径）时按账号级偏移错开。
+func (s *Scheduler) runKeepalive(ctx context.Context, spread bool) {
+	plan := s.spreadPlan(taskKeepalive, spread, time.Now())
 	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range plan.order(s.cfg.Pool.List()) {
 		if st.Disabled && !includeDisabled {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
+		}
+		if !plan.wait(ctx, st.UID) {
+			return
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)

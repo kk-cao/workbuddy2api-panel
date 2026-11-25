@@ -24,8 +24,8 @@ const (
 	// `@genie/agent-cli`（2.176.0，见 resources/app.asar.unpacked/cli/package.json）。
 	defaultCliVersion = "2.176.0"
 	// defaultClientVersionGlobal / defaultCliVersionGlobal 国际版（global realm）桌面分发包
-	// 版本段。2026-11-16 国际版 WorkBuddy AI 安装包实测为 5.11.4（内置 CLI 2.176.0）。
-	defaultClientVersionGlobal = "5.11.4"
+	// 版本段。2026-11-26 国际版 WorkBuddy AI 安装包实测为 5.11.7（内置 CLI 2.176.0）。
+	defaultClientVersionGlobal = "5.11.7"
 	defaultCliVersionGlobal    = "2.176.0"
 
 	// defaultClientIdentityPlatform 5.11.x 桌面端 X-Client-Platform 固定值（client-identity.js）。
@@ -55,7 +55,7 @@ func (c *Client) cliVersion() string {
 }
 
 // clientVersionFor 按账号 realm 取生效的 WorkBuddy 客户端版本段。
-// 优先级：realm 专用显式配置（仅 global）> 通用显式配置 > realm 内置默认（CN 5.11.3 / global 5.11.4）。
+// 优先级：realm 专用显式配置（仅 global）> 通用显式配置 > realm 内置默认（CN 5.11.3 / global 5.11.7）。
 func (c *Client) clientVersionFor(a *auth.Auth) string {
 	global := a != nil && a.IsGlobal()
 	if global && c != nil && c.ClientVersionGlobal != "" {
@@ -155,7 +155,7 @@ func clientIdentityDisabled() bool {
 	return os.Getenv("WB2A_NO_CLIENT_IDENTITY") == "1" || os.Getenv("WB2_NO_CLIENT_IDENTITY") == "1"
 }
 
-// injectClientIdentityHeaders 注入 5.11.3（CN）/ 5.11.4（global）app.asar client-identity.js
+// injectClientIdentityHeaders 注入 5.11.3（CN）/ 5.11.7（global）app.asar client-identity.js
 // 对齐的 X-Client-* 三件套；设环境变量 WB2A_NO_CLIENT_IDENTITY=1（或 WB2_NO_CLIENT_IDENTITY=1）可关闭。
 func (c *Client) injectClientIdentityHeaders(req *http.Request, a *auth.Auth) {
 	if clientIdentityDisabled() {
@@ -245,7 +245,7 @@ type ChatMeta struct {
 	AgentType             string // X-Agent-Type：空默认 "main"，后台任务填 AgentTypeAuxiliary ("auxiliary")
 }
 
-// ChatHeaders 在 common 之上加 chat 专属头族（对齐 5.11.3 CN / 5.11.4 Global 桌面端完整 46 头形态）。
+// ChatHeaders 在 common 之上加 chat 专属头族（对齐 5.11.3 CN / 5.11.7 Global 桌面端完整 46 头形态）。
 func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, meta ChatMeta) {
 	c.CommonHeaders(req, a)
 	req.Header.Del("Origin")
@@ -341,7 +341,7 @@ func domainOf(a *auth.Auth) string {
 	return a.DomainValue()
 }
 
-// privateDataHeaderValue 根据发行版（Global 5.11.4 DefaultModelOptimizationOff=true）与企业态返回 X-Private-Data。
+// privateDataHeaderValue 根据发行版（Global 5.11.7 DefaultModelOptimizationOff=true）与企业态返回 X-Private-Data。
 func privateDataHeaderValue(a *auth.Auth) string {
 	if a != nil && (a.IsEnterprise() || a.IsGlobal()) {
 		return "true"

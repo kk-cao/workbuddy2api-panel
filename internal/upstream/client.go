@@ -1550,9 +1550,9 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 // codeBuddyIDEUA /v3/config 要求能解析出 CodeBuddy 版本号的 UA（跟随 CN IDE 4.12.4）。
 const codeBuddyIDEUA = "CodeBuddyIDE/4.12.4 CodeBuddy/4.12.4"
 
-// codeBuddyCLIUA CLI 三段式 UA（跟随 npm @tencent-ai/codebuddy-code 2.185.0）。
+// codeBuddyCLIUA CLI 三段式 UA（跟随 npm @tencent-ai/codebuddy-code 2.187.0）。
 // 该常量仅用于 global 侧第二路探测；CN 侧仍走 codeBuddyIDEUA 单路。
-const codeBuddyCLIUA = "CLI/2.185.0 CodeBuddy/2.185.0"
+const codeBuddyCLIUA = "CLI/2.187.0 CodeBuddy/2.187.0"
 
 // FetchModels 调上游动态模型接口（CN 侧；global 账号见 global_models.go 家族）。
 //

@@ -859,3 +859,42 @@ func TestServerReadTimeout(t *testing.T) {
 		t.Error("unparsable read_timeout should fail fast")
 	}
 }
+
+func TestScheduleJitterSpreadDefaultsAndBounds(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Schedule.JitterMinutes != 15 || c.Schedule.AccountSpreadMinutes != 5 || c.Schedule.AccountSpreadMinGapSeconds != 15 {
+		t.Fatalf("unexpected defaults: jitter=%d spread=%d gap=%d",
+			c.Schedule.JitterMinutes, c.Schedule.AccountSpreadMinutes, c.Schedule.AccountSpreadMinGapSeconds)
+	}
+
+	// 显式置 0 关闭抖动与错峰。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "zero.json")
+	os.WriteFile(fp, []byte(`{"schedule":{"jitter_minutes":0,"account_spread_minutes":0,"account_spread_min_gap_seconds":0}}`), 0o600)
+	cz, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cz.Schedule.JitterMinutes != 0 || cz.Schedule.AccountSpreadMinutes != 0 || cz.Schedule.AccountSpreadMinGapSeconds != 0 {
+		t.Fatalf("explicit 0 must stick: %+v", cz.Schedule)
+	}
+
+	// 越界校验。
+	for _, raw := range []string{
+		`{"schedule":{"jitter_minutes":-1}}`,
+		`{"schedule":{"jitter_minutes":60}}`,
+		`{"schedule":{"account_spread_minutes":-1}}`,
+		`{"schedule":{"account_spread_minutes":1441}}`,
+		`{"schedule":{"account_spread_min_gap_seconds":-1}}`,
+		`{"schedule":{"account_spread_min_gap_seconds":3601}}`,
+	} {
+		bf := filepath.Join(dir, "bad.json")
+		os.WriteFile(bf, []byte(raw), 0o600)
+		if _, err := Load(bf); err == nil {
+			t.Errorf("expected error for %s", raw)
+		}
+	}
+}

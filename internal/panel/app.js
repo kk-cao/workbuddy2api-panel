@@ -416,7 +416,10 @@ function renderAccounts(list) {
     else if (s.paused) { cls = 'off'; tag = '<span class="tag warn">已暂停选号</span>'; }
     else if (cool > 0) {
       cls = 'cool';
-      const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
+      // 标签按服务端给的 cool_kind 判，不比较秒数：cool_remaining_sec 是服务端向上取整的整秒，
+      // bl 是前端后算的浮点秒，只差几十毫秒 ⇒ bl > cool_remaining_sec 恒为 false，
+      // 导致「只有熔断」永远错显为「限流冷却」。state.go 已在 CoolKind 里给出权威结论。
+      const kind = s.cool_kind === 'breaker' ? '熔断'
         : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
@@ -1158,6 +1161,9 @@ const CFG_MAP = {
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
   task_sweep_enabled: ['schedule', 'task_sweep_enabled'], task_sweep_minutes: ['schedule', 'task_sweep_minutes'],
+  jitter_minutes: ['schedule', 'jitter_minutes'],
+  account_spread_minutes: ['schedule', 'account_spread_minutes'],
+  account_spread_min_gap_seconds: ['schedule', 'account_spread_min_gap_seconds'],
   include_disabled_in_tasks: ['schedule', 'include_disabled_in_tasks'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   breaker_threshold: ['pool', 'breaker_threshold'],

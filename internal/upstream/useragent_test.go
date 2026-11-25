@@ -335,7 +335,7 @@ func TestBillingUA_WhenClientNameEmpty(t *testing.T) {
 
 var _ = io.Discard
 
-// TestUserAgentRealmVersions CN/global 按 realm 分档：chat 首段恒 WorkBuddy，第二段按 realm 区分品牌（CN WorkBuddy 5.11.3 / global workbuddy-ai 5.11.4）。
+// TestUserAgentRealmVersions CN/global 按 realm 分档：chat 首段恒 WorkBuddy，第二段按 realm 区分品牌（CN WorkBuddy 5.11.3 / global workbuddy-ai 5.11.7）。
 func TestUserAgentRealmVersions(t *testing.T) {
 	c := &Client{}
 	cn := &auth.Auth{AccessToken: "at", UID: "u1", Domain: "www.codebuddy.cn"}
@@ -344,13 +344,13 @@ func TestUserAgentRealmVersions(t *testing.T) {
 	if got, want := c.userAgent(cn), "WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0"; got != want {
 		t.Errorf("CN UA = %q want %q", got, want)
 	}
-	if got, want := c.userAgent(gl), "WorkBuddy/5.11.4 workbuddy-ai/5.11.4 CLI/2.176.0"; got != want {
+	if got, want := c.userAgent(gl), "WorkBuddy/5.11.7 workbuddy-ai/5.11.7 CLI/2.176.0"; got != want {
 		t.Errorf("global UA = %q want %q", got, want)
 	}
 	if got, want := c.rpcUAFor(cn), "WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0"; got != want {
 		t.Errorf("CN RPC UA = %q want %q", got, want)
 	}
-	if got, want := c.rpcUAFor(gl), "workbuddy-ai/5.11.4 workbuddy-ai/5.11.4 CLI/2.176.0"; got != want {
+	if got, want := c.rpcUAFor(gl), "workbuddy-ai/5.11.7 workbuddy-ai/5.11.7 CLI/2.176.0"; got != want {
 		t.Errorf("global RPC UA = %q want %q", got, want)
 	}
 

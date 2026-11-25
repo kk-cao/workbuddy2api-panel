@@ -1024,6 +1024,18 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </div>
             <div class="hint">周期扫描全部账号，把「进度已达标但尚未领奖」的成长任务补领掉（不含自动动作的口令任务也能领），并顺带接受未接受的任务。只发 accept / claim 两条<b>幂等</b>请求，不跑任何对话或上报行为，开销可忽略。<br>用途：真实对话点亮的任务不在自动动作白名单里，成长队列与「一键完成」都不会去领它——积分因此卡在半路上不去（#174）。</div>
             <div class="hr"></div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">整点抖动窗口（分钟）</span>
+                <input name="jitter_minutes" type="number" min="0" max="59" placeholder="15">
+                <span class="hint">0 = 精确整点；正值按任务族错开启动，避开整点限流</span></label>
+              <label class="fld"><span class="lb">账号错峰窗口（分钟）</span>
+                <input name="account_spread_minutes" type="number" min="0" max="1440" placeholder="5">
+                <span class="hint">0 = 关闭；定时遍历任务在窗口内按账号错开执行</span></label>
+              <label class="fld"><span class="lb">账号最小间隔（秒）</span>
+                <input name="account_spread_min_gap_seconds" type="number" min="0" max="3600" placeholder="15">
+                <span class="hint">0 = 仅随机偏移；冲突时顺延保证两号最小间距</span></label>
+            </div>
+            <div class="hr"></div>
             <div class="switch"><span class="lb">保号任务覆盖已禁用账号</span>
               <input type="checkbox" name="include_disabled_in_tasks"></div>
             <div class="hint">禁用只关选号：打开后已禁用的账号仍会签到 / 活跃上报 / 保活 / 刷新余额（依旧不参与选号）。适合「一次只放开一个账号、用禁用做流量开关」的轮换养号用法，默认关闭。<br>若只想让<b>单个</b>账号临时退出选号但保留保号，直接用账号行的「<b>暂停选号</b>」按钮（账号级，无需打开本开关）。</div>
@@ -1133,8 +1145,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="client_version" placeholder="留空 = 5.11.3">
                 <span class="hint">UA 的 WorkBuddy 段 + <code>X-IDE-Version</code> + <code>X-Client-Version</code>；对应 CN 桌面端 5.11.3 安装包</span></label>
               <label class="fld"><span class="lb">客户端版本（国际版）</span>
-                <input name="client_version_global" placeholder="留空 = 5.11.4">
-                <span class="hint">global 号专用；对应国际版 5.11.4 安装包，CN 号不受影响</span></label>
+                <input name="client_version_global" placeholder="留空 = 5.11.7">
+                <span class="hint">global 号专用；对应国际版 5.11.7 安装包，CN 号不受影响</span></label>
             </div>
             <div class="grid2">
               <label class="fld"><span class="lb">客户端 CLI 版本（CN）</span>
@@ -1142,20 +1154,20 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <span class="hint">UA 的 <code>CLI/</code> 段；5.11.3 桌面端<b>内置</b>的 CLI（非独立 npm 全局包）</span></label>
               <label class="fld"><span class="lb">客户端 CLI 版本（国际版）</span>
                 <input name="cli_version_global" placeholder="留空 = 2.176.0">
-                <span class="hint">global 号专用；国际版 5.11.4 内置 CLI 同样是 2.176.0</span></label>
+                <span class="hint">global 号专用；国际版 5.11.7 内置 CLI 同样是 2.176.0</span></label>
             </div>
             <div class="grid2">
               <label class="fld"><span class="lb">目录探测 UA（CN）</span>
                 <input name="models_probe_ua_cn" placeholder="留空 = CodeBuddyIDE/4.12.4 CodeBuddy/4.12.4">
                 <span class="hint">仅用于 <code>/v3/config</code> 拉模型目录；该端点按 UA 的<b>产品前缀</b>（<code>WorkBuddy/</code> <code>CodeBuddyIDE/</code> <code>CLI/</code>）下发不同目录，版本号不影响。换前缀会改模型列表，需重启</span></label>
               <label class="fld"><span class="lb">目录探测 UA（国际版）</span>
-                <input name="models_probe_ua_global" placeholder="留空 = 与聊天 UA 相同（WorkBuddy/5.11.4 …）">
+                <input name="models_probe_ua_global" placeholder="留空 = 与聊天 UA 相同（WorkBuddy/5.11.7 …）">
                 <span class="hint">global 号专用；留空时直接用聊天 UA（单一身份）。需重启</span></label>
             </div>
             <div class="grid2">
               <label class="fld"><span class="lb">当前生效形态</span>
                 <span class="hint">CN 号 → <code>WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0</code><br>
-                global 号 → <code>WorkBuddy/5.11.4 workbuddy-ai/5.11.4 CLI/2.176.0</code><br>
+                global 号 → <code>WorkBuddy/5.11.7 workbuddy-ai/5.11.7 CLI/2.176.0</code><br>
                 以上四项留空时即为该值；<code>X-Client-Product</code> 分别随包为 <code>WorkBuddy</code> / <code>workbuddy-ai</code>。</span></label>
             </div>
             <div class="hr"></div>

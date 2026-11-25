@@ -118,6 +118,14 @@ type Config struct {
 		// 只做 accept/claim 两条幂等请求，不跑任何行为链路；分钟级开销可忽略。
 		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
 		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
+
+		// JitterMinutes 名义整点之后的确定性偏移窗口（分钟）。0 = 精确整点；缺省 15，上限 59。
+		// 不同任务族按 FNV(kind|日|小时) 错开在不同分钟启动，避开整点脉冲与同槽双任务撞 429。
+		JitterMinutes int `json:"jitter_minutes"`
+		// AccountSpreadMinutes 账号级摊开窗口（分钟）。0 = 关闭；缺省 5，上限 1440。
+		AccountSpreadMinutes int `json:"account_spread_minutes"`
+		// AccountSpreadMinGapSeconds 账号摊开时相邻两账号的最小间隔秒数。0 = 仅随机；缺省 15，上限 3600。
+		AccountSpreadMinGapSeconds int `json:"account_spread_min_gap_seconds"`
 	} `json:"schedule"`
 
 	Global struct {
@@ -164,7 +172,7 @@ type Config struct {
 		ModelsProbeUACN     string `json:"models_probe_ua_cn"`
 		ModelsProbeUAGlobal string `json:"models_probe_ua_global"`
 		// ClientVersionGlobal 国际版（global realm）专用客户端版本段。
-		// CN 与 intl 两条独立发版线（2026-11：CN 5.11.3 / intl 5.11.4）。空 = 内置默认 5.11.4。
+		// CN 与 intl 两条独立发版线（2026-11：CN 5.11.3 / intl 5.11.7）。空 = 内置默认 5.11.7。
 		ClientVersionGlobal string `json:"client_version_global"`
 		// CliVersionGlobal 国际版专用 `CLI/<ver>` 段。空 = 内置默认 2.176.0。
 		CliVersionGlobal string `json:"cli_version_global"`
@@ -315,6 +323,9 @@ func Default() *Config {
 	c.Schedule.BalanceRefreshMinutes = 5
 	c.Schedule.TaskSweepEnabled = true
 	c.Schedule.TaskSweepMinutes = 15
+	c.Schedule.JitterMinutes = 15
+	c.Schedule.AccountSpreadMinutes = 5
+	c.Schedule.AccountSpreadMinGapSeconds = 15
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -675,6 +686,15 @@ func (c *Config) normalize() error {
 			c.Schedule.TaskSweepMinutes = 15
 		}
 		c.TaskSweepInterval = time.Duration(c.Schedule.TaskSweepMinutes) * time.Minute
+	}
+	if c.Schedule.JitterMinutes < 0 || c.Schedule.JitterMinutes > 59 {
+		return fmt.Errorf("schedule.jitter_minutes: %d 非法（0 = 精确整点，上限 59）", c.Schedule.JitterMinutes)
+	}
+	if c.Schedule.AccountSpreadMinutes < 0 || c.Schedule.AccountSpreadMinutes > 1440 {
+		return fmt.Errorf("schedule.account_spread_minutes: %d 非法（0 = 关闭，上限 1440）", c.Schedule.AccountSpreadMinutes)
+	}
+	if c.Schedule.AccountSpreadMinGapSeconds < 0 || c.Schedule.AccountSpreadMinGapSeconds > 3600 {
+		return fmt.Errorf("schedule.account_spread_min_gap_seconds: %d 非法（0 = 仅随机，上限 3600）", c.Schedule.AccountSpreadMinGapSeconds)
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err

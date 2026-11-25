@@ -7,6 +7,7 @@
 package scheduler
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"time"
@@ -15,9 +16,17 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
+// streakAccountDelay 排程错峰路径下连登管家账号间平滑间隔，避免签到错峰结束后瞬间连发多组 RPC。
+var streakAccountDelay = 2 * time.Second
+
 // RunStreakBonusNow 对所有可用账号执行连登兑换 + 抽奖（幂等：locked/无次数自动跳过）。
-// 由签到排程（RunCheckinNow）末尾调用；也可面板手动触发。
+// 由面板手动触发；排程签到末尾走 runStreakBonus(ctx, spread)。
 func (s *Scheduler) RunStreakBonusNow() {
+	s.runStreakBonus(context.Background(), false)
+}
+
+func (s *Scheduler) runStreakBonus(ctx context.Context, pace bool) {
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -32,6 +41,12 @@ func (s *Scheduler) RunStreakBonusNow() {
 		if a.IsEnterpriseSession() {
 			continue // 企业版 / 企业切换会话门控：无成长体系（/activity/growth/streak 企业号 403；切换会话 200 但不计分）
 		}
+		if pace && !first {
+			if !sleepCtx(ctx, streakAccountDelay) {
+				return
+			}
+		}
+		first = false
 		s.streakBonusAccount(a)
 	}
 }

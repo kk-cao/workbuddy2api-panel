@@ -1519,3 +1519,73 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+// TestAppJSRenderAccountsCoolKind 验证 renderAccounts 直接按 cool_kind 渲染熔断标签：
+// 即使 breaker_until 距今浮点秒略小于服务端向上取整的 cool_remaining_sec，也必须显示「熔断」。
+func TestAppJSRenderAccountsCoolKind(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; renderAccounts cool_kind test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const accBody = { innerHTML: '', addEventListener() {} };
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; },
+  apply() { return inert; },
+  construct() { return inert; },
+  has() { return true; },
+});
+const sandbox = new Proxy({
+  location: { hash: '#accounts' },
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: {
+    querySelectorAll: () => [],
+    querySelector: () => inert,
+    getElementById: id => (id === 'accBody' ? accBody : inert),
+    addEventListener() {}, documentElement: inert, head: inert, body: inert, createElement: () => inert, cookie: '',
+  },
+  fetch: () => new Promise(() => {}),
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  setInterval() { return 0; }, clearInterval() {}, setTimeout() { return 0; }, clearTimeout() {},
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
+}, { get(t, k) { return t[k]; }, has() { return true; } });
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src + '\nthis.__renderAccounts = renderAccounts;', sandbox, { filename: 'app.js' });
+const now = Date.now();
+sandbox.__renderAccounts([
+  { uid: 'u-brk', nickname: 'brk', realm: 'cn', credits: 100, credits_total: 100,
+    cooling: true, cool_kind: 'breaker', cool_remaining_sec: 720,
+    breaker_until: new Date(now + 719.2 * 1000).toISOString() },
+  { uid: 'u-cred', nickname: 'cred', realm: 'cn', credits: 0, credits_total: 100,
+    cooling: true, cool_kind: 'hard_credit', cool_remaining_sec: 300 },
+  { uid: 'u-soft', nickname: 'soft', realm: 'cn', credits: 50, credits_total: 100,
+    cooling: true, cool_kind: 'soft_rate', cool_remaining_sec: 120 },
+]);
+process.stdout.write(accBody.innerHTML);
+process.exit(0);`
+	f, err := os.CreateTemp(t.TempDir(), "coolkind-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("renderAccounts cool_kind node test failed: %v\n%s", err, out)
+	}
+	html := string(out)
+	for _, want := range []string{`>熔断 · `, `>积分冷却 · `, `>限流冷却 · `} {
+		if !strings.Contains(html, want) {
+			t.Errorf("rendered HTML missing %q\nhtml=%s", want, html)
+		}
+	}
+}
+

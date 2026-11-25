@@ -3,6 +3,7 @@
 package scheduler
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
@@ -47,8 +48,13 @@ func travelDay(t time.Time) string {
 // 401/查询失败只跳过该账号本轮（不强刷 token，交 22:00 keepalive）；
 // 账号间限速 travelAccountDelay。
 func (s *Scheduler) RunTravelNow() {
+	s.runTravel(context.Background(), false)
+}
+
+func (s *Scheduler) runTravel(ctx context.Context, spread bool) {
+	plan := s.spreadPlan(taskTravel, spread, time.Now())
 	first := true
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range plan.order(s.cfg.Pool.List()) {
 		if st.Disabled {
 			continue
 		}
@@ -62,8 +68,14 @@ func (s *Scheduler) RunTravelNow() {
 		if a.IsEnterpriseSession() {
 			continue // 企业版 / 企业切换会话门控：无成长体系（growth 端点企业号 403；切换会话不计分），不发起任何上游调用
 		}
-		if !first {
-			time.Sleep(travelAccountDelay)
+		if plan != nil {
+			if !plan.wait(ctx, st.UID) {
+				return
+			}
+		} else if !first {
+			if !sleepCtx(ctx, travelAccountDelay) {
+				return
+			}
 		}
 		first = false
 		s.travelOne(a)

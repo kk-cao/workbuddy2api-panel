@@ -212,7 +212,10 @@ func main() {
 		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
 		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
-		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
+		IncludeDisabledInTasks:     cfg.Schedule.IncludeDisabledInTasks,
+		JitterMinutes:              cfg.Schedule.JitterMinutes,
+		AccountSpreadMinutes:       cfg.Schedule.AccountSpreadMinutes,
+		AccountSpreadMinGapSeconds: cfg.Schedule.AccountSpreadMinGapSeconds,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -257,6 +260,13 @@ func main() {
 	}
 	if cfg.Schedule.IncludeDisabledInTasks {
 		log.Printf("保号任务覆盖禁用账号（schedule.include_disabled_in_tasks=true）：禁用号仍签到 / 活跃 / 保活 / 刷新余额，但不参与选号")
+	}
+	if cfg.Schedule.JitterMinutes > 0 {
+		log.Printf("排程整点抖动：各任务在名义整点后 0-%d 分钟内确定性错开（schedule.jitter_minutes）", cfg.Schedule.JitterMinutes)
+	}
+	if cfg.Schedule.AccountSpreadMinutes > 0 {
+		log.Printf("账号级错峰：定时遍历任务在 %d 分钟窗口内按账号错开，最小间隔 %d 秒（schedule.account_spread_minutes）",
+			cfg.Schedule.AccountSpreadMinutes, cfg.Schedule.AccountSpreadMinGapSeconds)
 	}
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
@@ -557,6 +567,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+	sch.SetJitterAndSpread(newCfg.Schedule.JitterMinutes, newCfg.Schedule.AccountSpreadMinutes, newCfg.Schedule.AccountSpreadMinGapSeconds)
 
 	return restartRequiredFields(newCfg), nil
 }
